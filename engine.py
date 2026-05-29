@@ -12,6 +12,7 @@ import torch
 import util.misc as utils
 from datasets.datasets_gen.hico_eval_triplet import HICOEvaluator as HICOEvaluator_gen
 from datasets.datasets_gen.vcoco_eval import VCOCOEvaluator as VCOCOEvaluator_gen
+from datasets.datasets_gen.vidhoi_eval import VidHOIEvaluator
 import json
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -214,6 +215,10 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
             evaluator = HICOEvaluator_gen(test_pred, gts, data_loader.dataset.rare_triplets,
                                           data_loader.dataset.non_rare_triplets,
                                           data_loader.dataset.correct_mat, args=args)
+        elif dataset_file == 'vidhoi':
+            evaluator = VidHOIEvaluator(test_pred, gts, use_nms_filter=args.use_nms_filter,
+                                        thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
+                                        nms_beta=args.nms_beta)
         else:
             evaluator = VCOCOEvaluator_gen(preds, gts, data_loader.dataset.correct_mat,
                                            use_nms_filter=args.use_nms_filter)
@@ -262,7 +267,7 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                         re_map = stats['mAP']
                     elif dataset_file == 'vcoco':
                         re_map = stats['mAP_all']
-                    elif dataset_file == 'hoia':
+                    elif dataset_file in ('hoia', 'vidhoi'):
                         re_map = stats['mAP']
                     else:
                         raise NotImplementedError
@@ -285,6 +290,10 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         if args.dataset_root == 'GEN':
             evaluator = VCOCOEvaluator_gen(preds, gts, data_loader.dataset.correct_mat,
                                            use_nms_filter=args.use_nms_filter)
+    elif dataset_file == 'vidhoi':
+        evaluator = VidHOIEvaluator(preds, gts, use_nms_filter=args.use_nms_filter,
+                                    thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
+                                    nms_beta=args.nms_beta)
     else:
         raise NotImplementedError
     start_time = time.time()

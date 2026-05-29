@@ -5,6 +5,7 @@ import random
 import time
 from pathlib import Path
 import logging
+import debugpy
 
 import numpy as np
 import torch
@@ -125,6 +126,10 @@ def get_args_parser():
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
     parser.add_argument('--hoi_path', type=str)
+    parser.add_argument('--train_ratio', default=1.0, type=float,
+                        help='Fraction of training annotations to use (VidHOI)')
+    parser.add_argument('--val_ratio', default=1.0, type=float,
+                        help='Fraction of validation annotations to use (VidHOI, unused)')
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -207,7 +212,7 @@ def get_args_parser():
 
     # zero shot enhancement
     parser.add_argument('--training_free_enhancement_path', default='', type=str)
-
+    parser.add_argument('--debug', action='store_true', help='use debug mode for training.')
     return parser
 
 
@@ -217,7 +222,7 @@ def main(args):
     else:
         args.distributed = False
 
-    # args.save_points = [int(i) for i in args.save_points]
+    args.save_points = []  # populated via --save_points if the arg is ever added back
 
     print('setting up seeds')
     setup_seed(233)
@@ -229,6 +234,16 @@ def main(args):
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
+
+    timestamp = datetime.datetime.now().strftime("%m%d%H%M")
+    output_dir = Path(args.output_dir) / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.debug:
+        if args.rank == 0:
+            debugpy.listen(("0.0.0.0", 5678))
+            print("Wait Debugger Connection")
+            debugpy.wait_for_client()
+            print("Debugger Attached")
 
     device = torch.device(args.device)
 
@@ -466,7 +481,7 @@ def main(args):
                 performance = test_stats['mAP']
             elif args.dataset_file == 'vcoco':
                 performance = test_stats['mAP_all']
-            elif args.dataset_file == 'hoia':
+            elif args.dataset_file in ('hoia', 'vidhoi'):
                 performance = test_stats['mAP']
             best_performance = performance
         except:
@@ -507,8 +522,10 @@ def main(args):
             performance = test_stats['mAP']
         elif args.dataset_file == 'vcoco':
             performance = test_stats['mAP_all']
-        elif args.dataset_file == 'hoia':
+        elif args.dataset_file in ('hoia', 'vidhoi'):
             performance = test_stats['mAP']
+        else:
+            performance = 0.0
 
         if performance > best_performance:
             checkpoint_path = os.path.join(output_dir, 'checkpoint_best.pth')

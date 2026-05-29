@@ -1,3 +1,17 @@
+"""
+HOICLIP 主模型与训练/推理相关组件。
+
+该文件主要包含：
+- `HOICLIP`：DETR 风格的 HOI 检测模型。backbone 提供空间特征，`GEN`(见 `gen.py`) 生成
+  human/object/interaction 的 query 表征，并与 CLIP 特征融合得到 HOI 分类 logits。
+- `SetCriterionHOI`：训练损失（匹配、分类、框回归、可选 mimic/重建损失等）。
+- `PostProcessHOITriplet`：推理后处理，把归一化框坐标映射回原图尺寸，并整理输出字段。
+- `build`：按 args 组装 model / criterion / postprocessors。
+
+注：本实现大量依赖配置项 `args`（数据集类型、是否使用 CLIP 初始化、zero-shot 设置等）。
+"""
+
+import os
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -11,6 +25,7 @@ from ModifiedCLIP import clip
 from datasets.hico_text_label import hico_text_label, hico_obj_text_label, hico_unseen_index
 from datasets.vcoco_text_label import vcoco_hoi_text_label, vcoco_obj_text_label
 from datasets.static_hico import HOI_IDX_TO_ACT_IDX
+from datasets.vidhoi_text_label import vidhoi_text_label, vidhoi_obj_text_label
 
 from ..backbone import build_backbone
 from ..matcher import build_matcher
@@ -18,11 +33,27 @@ from .gen import build_gen
 
 
 def _sigmoid(x):
+    # 带截断的 sigmoid，避免极端值导致 log/梯度数值不稳定（常用于 focal loss 变体）。
     y = torch.clamp(x.sigmoid(), min=1e-4, max=1 - 1e-4)
     return y
 
 
 class HOICLIP(nn.Module):
+    """
+    HOICLIP 模型。
+
+    核心思路：
+    - backbone 提取图像特征；1x1 conv 投影到 transformer hidden_dim。
+    - 使用两组 query（human/object）解码实例，再构造交互表征（interaction）并与 CLIP 视觉 token 融合。
+    - HOI/Obj 分类可选择使用 CLIP 文本原型初始化的线性层（zero-shot/可迁移），并配合可学习的 logit_scale。
+
+    forward 输出（主要字段）：
+    - `pred_hoi_logits` / `pred_obj_logits`：HOI 与对象分类 logits
+    - `pred_sub_boxes` / `pred_obj_boxes`：subject/object 的 box（cx,cy,w,h，归一化到 [0,1]）
+    - `clip_visual` / `clip_logits`：来自 CLIP 的视觉特征与 HOI 相似度得分（用于辅助/分析）
+    - `aux_outputs`：若 `aux_loss=True`，返回中间层的辅助预测用于深监督
+    """
+
     def __init__(self, backbone, transformer, num_queries, aux_loss=False, args=None):
         super().__init__()
 
@@ -30,21 +61,29 @@ class HOICLIP(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        # DETR 风格的 learnable queries：分别用于 human 与 object。
         self.query_embed_h = nn.Embedding(num_queries, hidden_dim)
         self.query_embed_o = nn.Embedding(num_queries, hidden_dim)
+        # 用于引导 query 的位置 embedding（会加到 human/object queries 上）。
         self.pos_guided_embedd = nn.Embedding(num_queries, hidden_dim)
+        # box 回归头（MLP 输出 4 维，后续 sigmoid 到 [0,1]）。
         self.hum_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.obj_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        # 将交互特征映射到“verb”空间（后续通过 verb2hoi 投影辅助 HOI 分类）。
         self.inter2verb = MLP(args.clip_embed_dim, args.clip_embed_dim // 2, args.clip_embed_dim, 3)
+        # backbone 通道 -> transformer hidden_dim 的线性投影。
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.dec_layers = self.args.dec_layers
 
+        # CLIP 类似的可学习温度参数（指数后作为 logit_scale）。
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.obj_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # 加载 CLIP（ModifiedCLIP）模型，用于文本原型初始化与图像编码。
         self.clip_model, self.preprocess = clip.load(self.args.clip_model)
 
+        # 根据数据集选择 HOI/OBJ 的文本标签表（用于 CLIP 文本编码）。
         if self.args.dataset_file == 'hico':
             hoi_text_label = hico_text_label
             obj_text_label = hico_obj_text_label
@@ -53,12 +92,21 @@ class HOICLIP(nn.Module):
             hoi_text_label = vcoco_hoi_text_label
             obj_text_label = vcoco_obj_text_label
             unseen_index = None
+        elif self.args.dataset_file == 'vidhoi':
+            hoi_text_label = vidhoi_text_label
+            # append a "nothing" class so num_obj_classes = len(vidhoi_obj_text_label)
+            obj_text_label = vidhoi_obj_text_label + [(len(vidhoi_obj_text_label), 'a photo of nothing')]
+            unseen_index = None
 
+        # 使用 CLIP 文本编码器初始化分类器权重（可选对 unseen 类做删除/分支初始化）。
         clip_label, obj_clip_label, v_linear_proj_weight, hoi_text, obj_text, train_clip_label = \
             self.init_classifier_with_CLIP(hoi_text_label, obj_text_label, unseen_index, args.no_clip_cls_init)
+            # clip_label: hoi_text_feature, obj_clip_label: obj_text_feature, v_linear_proj_weight: clip_model.visual.proj(冻结)，hoi_text: 按 zero-shot 配置删除 unseen 后标签，obj_text: tokenized 的 object 文本，train_clip_label: 按 zero-shot 配置删除 unseen 后的 hoi_text_feature（用于训练分支初始化）
         num_obj_classes = len(obj_text) - 1  # del nothing
-        self.clip_visual_proj = v_linear_proj_weight
+        # CLIP 视觉投影矩阵（用于将 CLIP visual features 对齐到 embedding 空间）。
+        self.clip_visual_proj = v_linear_proj_weight  # clip_model.visual.proj(冻结)
 
+        # 将 transformer hidden_dim 的特征映射到 CLIP embedding 维度（用于后续融合/损失）。
         self.hoi_class_fc = nn.Sequential(
             nn.Linear(hidden_dim, args.clip_embed_dim),
             nn.LayerNorm(args.clip_embed_dim),
@@ -80,6 +128,23 @@ class HOICLIP(nn.Module):
             self.verb_projection = nn.Linear(args.clip_embed_dim, 117, bias=False)
             self.verb_projection.weight.data = torch.load(args.verb_pth, map_location='cpu')
             self.verb_weight = args.verb_weight
+        elif self.args.dataset_file == 'vidhoi':
+            # verb2hoi_proj[v][hoi_idx] = 1 when HOI class hoi_idx has verb v.
+            # Shape: (num_verb_classes, num_hoi_classes)
+            text_label_ids = list(vidhoi_text_label.keys())
+            n_verb = args.num_verb_classes
+            n_hoi = len(text_label_ids)
+            verb2hoi_proj = torch.zeros(n_verb, n_hoi)
+            for hoi_idx, (v, _) in enumerate(text_label_ids):
+                verb2hoi_proj[v][hoi_idx] = 1.0
+            self.verb2hoi_proj = nn.Parameter(verb2hoi_proj, requires_grad=False)
+            self.verb_projection = nn.Linear(args.clip_embed_dim, n_verb, bias=False)
+            verb_pth = getattr(args, 'verb_pth', '')
+            if verb_pth and os.path.exists(verb_pth):
+                loaded = torch.load(verb_pth, map_location='cpu')
+                if loaded.shape == self.verb_projection.weight.shape:
+                    self.verb_projection.weight.data = loaded
+            self.verb_weight = args.verb_weight
         else:
             verb2hoi_proj = torch.zeros(29, 263)
             for i in vcoco_hoi_text_label.keys():
@@ -91,37 +156,42 @@ class HOICLIP(nn.Module):
             self.verb_weight = args.verb_weight
 
         if args.with_clip_label:
+            # HOI 分类：使用 CLIP 文本原型初始化的线性层（可选冻结）。
             if args.fix_clip_label:
                 self.visual_projection = nn.Linear(args.clip_embed_dim, len(hoi_text), bias=False)
                 self.visual_projection.weight.data = train_clip_label / train_clip_label.norm(dim=-1, keepdim=True)
                 for i in self.visual_projection.parameters():
-                    i.require_grads = False
+                    i.require_grad = False
             else:
                 self.visual_projection = nn.Linear(args.clip_embed_dim, len(hoi_text))
                 self.visual_projection.weight.data = train_clip_label / train_clip_label.norm(dim=-1, keepdim=True)
 
             if self.args.dataset_file == 'hico' and self.args.zero_shot_type != 'default':
+                # zero-shot 评估时使用完整 600 类的投影（不删除 unseen）。
                 self.eval_visual_projection = nn.Linear(args.clip_embed_dim, 600, bias=False)
                 self.eval_visual_projection.weight.data = clip_label / clip_label.norm(dim=-1, keepdim=True)
         else:
+            # 不使用 CLIP label 初始化时，退化为普通的可学习分类头。
             self.hoi_class_embedding = nn.Linear(args.clip_embed_dim, len(hoi_text))
 
         if args.with_obj_clip_label:
+            # 对象分类同样可选择使用 CLIP 文本原型初始化。
             self.obj_class_fc = nn.Sequential(
                 nn.Linear(hidden_dim, args.clip_embed_dim),
                 nn.LayerNorm(args.clip_embed_dim),
             )
-            if args.fix_clip_label:
+            if args.fix_clip_label:    # use fixed clip label for object classification
                 self.obj_visual_projection = nn.Linear(args.clip_embed_dim, num_obj_classes + 1, bias=False)
                 self.obj_visual_projection.weight.data = obj_clip_label / obj_clip_label.norm(dim=-1, keepdim=True)
                 for i in self.obj_visual_projection.parameters():
                     i.require_grads = False
-            else:
+            else:                     # use learnable projection initialized by clip label
                 self.obj_visual_projection = nn.Linear(args.clip_embed_dim, num_obj_classes + 1)
                 self.obj_visual_projection.weight.data = obj_clip_label / obj_clip_label.norm(dim=-1, keepdim=True)
         else:
             self.obj_class_embed = nn.Linear(hidden_dim, num_obj_classes + 1)
 
+        # 将 HOI 文本原型传给 GEN（`gen.py` 中会用它计算 clip_hoi_score）。
         self.transformer.hoi_cls = clip_label / clip_label.norm(dim=-1, keepdim=True)
 
         self.hidden_dim = hidden_dim
@@ -131,6 +201,17 @@ class HOICLIP(nn.Module):
         nn.init.uniform_(self.pos_guided_embedd.weight)
 
     def init_classifier_with_CLIP(self, hoi_text_label, obj_text_label, unseen_index, no_clip_cls_init=False):
+        """
+        用 CLIP 文本编码器把 HOI/OBJ 的文本 prompt 编码成向量，用于初始化分类器权重。
+
+        返回：
+        - `text_embedding`：HOI 文本向量（可能包含全部类）
+        - `obj_text_embedding`：OBJ 文本向量
+        - `v_linear_proj_weight`：CLIP 视觉投影矩阵 `visual.proj`
+        - `hoi_text_label_del`：按 zero-shot 配置删除 unseen 后的 label dict（用于训练分支）
+        - `obj_text_inputs`：tokenized 的 object 文本（此处保留张量，主要用于统计/长度）
+        - `text_embedding_del`：删除 unseen 后的 HOI 文本向量（用于训练初始化）
+        """
         device = "cuda" if torch.cuda.is_available() else "cpu"
         text_inputs = torch.cat([clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
         if self.args.del_unseen and unseen_index is not None:
@@ -159,25 +240,33 @@ class HOICLIP(nn.Module):
             print('\nuse clip text encoder to init classifier weight\n')
             return text_embedding.float(), obj_text_embedding.float(), v_linear_proj_weight.float(), \
                    hoi_text_label_del, obj_text_inputs, text_embedding_del.float()
-        else:
+        else:  #随机初始化
             print('\nnot use clip text encoder to init classifier weight\n')
             return torch.randn_like(text_embedding.float()), torch.randn_like(
                 obj_text_embedding.float()), torch.randn_like(v_linear_proj_weight.float()), \
                    hoi_text_label_del, obj_text_inputs, torch.randn_like(text_embedding_del.float())
 
     def forward(self, samples: NestedTensor, is_training=True, clip_input=None, targets=None):
+        """
+        前向推理/训练。
+
+        - `samples`：可以是 `NestedTensor`，也可以是图片 tensor list（会被打包成 NestedTensor）。
+        - `clip_input`：送入 CLIP 的图像输入（一般是预处理后的图像 batch）。
+        """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
 
         src, mask = features[-1].decompose()
         assert mask is not None
+        # transformer(=GEN) 输出：human/object/interaction hidden states + CLIP 相关特征/打分。
         h_hs, o_hs, inter_hs, clip_cls_feature, clip_hoi_score, clip_visual = self.transformer(self.input_proj(src), mask,
-                                                self.query_embed_h.weight,
-                                                self.query_embed_o.weight,
-                                                self.pos_guided_embedd.weight,
-                                                pos[-1], self.clip_model, self.clip_visual_proj, clip_input)
+                                                 self.query_embed_h.weight,
+                                                 self.query_embed_o.weight,
+                                                 self.pos_guided_embedd.weight,
+                                                 pos[-1], self.clip_model, self.clip_visual_proj, clip_input)
 
+        # box 回归：对每一层 decoder 输出都预测 box，最后一层用于主输出。
         outputs_sub_coord = self.hum_bbox_embed(h_hs).sigmoid()
         outputs_obj_coord = self.obj_bbox_embed(o_hs).sigmoid()
 
@@ -193,6 +282,7 @@ class HOICLIP(nn.Module):
             logit_scale = self.logit_scale.exp()
             # inter_hs = self.hoi_class_fc(inter_hs)
             outputs_inter_hs = inter_hs.clone()
+            # verb 分支：将交互特征映射到 verb，再通过 verb2hoi 投影辅助 HOI 分类。
             verb_hs = self.inter2verb(inter_hs)
             inter_hs = inter_hs / inter_hs.norm(dim=-1, keepdim=True)
             verb_hs = verb_hs / verb_hs.norm(dim=-1, keepdim=True)
@@ -206,10 +296,12 @@ class HOICLIP(nn.Module):
                 outputs_verb_class = logit_scale * self.verb_projection(verb_hs) @ self.verb2hoi_proj
                 outputs_hoi_class = outputs_hoi_class + outputs_verb_class * self.verb_weight
         else:
+            # 不用 CLIP label 初始化：先投影到 clip_embed_dim，再用线性层输出类别。
             inter_hs = self.hoi_class_fc(inter_hs)
             outputs_inter_hs = inter_hs.clone()
             outputs_hoi_class = self.hoi_class_embedding(inter_hs)
 
+        # 统一整理输出字典：训练与推理都使用同一套 key。
         out = {'pred_hoi_logits': outputs_hoi_class[-1], 'pred_obj_logits': outputs_obj_class[-1],
                'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_obj_coord[-1], 'clip_visual': clip_visual,
                'clip_cls_feature': clip_cls_feature, 'hoi_feature': inter_hs[-1], 'clip_logits': clip_hoi_score}
@@ -231,7 +323,7 @@ class HOICLIP(nn.Module):
     @torch.jit.unused
     def _set_aux_loss_triplet(self, outputs_hoi_class, outputs_obj_class,
                               outputs_sub_coord, outputs_obj_coord, outputs_inter_hs=None):
-
+        # 将中间层预测整理成 list[dict]，用于 SetCriterion 中按层计算辅助损失。
         if outputs_hoi_class.shape[0] == 1:
             outputs_hoi_class = outputs_hoi_class.repeat(self.dec_layers, 1, 1, 1)
         aux_outputs = {'pred_hoi_logits': outputs_hoi_class[-self.dec_layers: -1],
@@ -266,6 +358,13 @@ class MLP(nn.Module):
 
 
 class SetCriterionHOI(nn.Module):
+    """
+    训练损失计算。
+
+    典型流程：
+    - matcher 先做匈牙利匹配（prediction queries ↔ ground truth interactions）。
+    - 基于匹配结果计算分类损失（HOI/OBJ）、框回归（L1 + GIoU）、以及可选的特征 mimic / 重建损失。
+    """
 
     def __init__(self, num_obj_classes, num_queries, num_verb_classes, matcher, weight_dict, eos_coef, losses, args):
         super().__init__()
@@ -338,6 +437,7 @@ class SetCriterionHOI(nn.Module):
         target_classes = torch.zeros_like(src_logits)
         target_classes[idx] = target_classes_o
         src_logits = _sigmoid(src_logits)
+        # HOI 分类使用 focal-like 的负样本挖掘损失（`_neg_loss`）。
         loss_hoi_ce = self._neg_loss(src_logits, target_classes, weights=None, alpha=self.alpha)
         losses = {'loss_hoi_labels': loss_hoi_ce}
 
@@ -387,6 +487,7 @@ class SetCriterionHOI(nn.Module):
         return losses
 
     def mimic_loss(self, outputs, targets, indices, num_interactions):
+        # 可选：用 L1 让交互特征逼近 CLIP 图像特征（feature mimic）。
         src_feats = outputs['inter_memory']
         src_feats = torch.mean(src_feats, dim=1)
 
@@ -397,6 +498,7 @@ class SetCriterionHOI(nn.Module):
         losses = {'loss_feat_mimic': loss_feat_mimic}
         return losses
     def reconstruction_loss(self, outputs, targets, indices, num_interactions):
+        # 可选：用 L1 让 HOI 特征重建/接近 CLIP 全局特征。
         raw_feature = outputs['clip_cls_feature']
         hoi_feature = outputs['hoi_feature']
 
@@ -490,6 +592,12 @@ class SetCriterionHOI(nn.Module):
 
 
 class PostProcessHOITriplet(nn.Module):
+    """
+    推理后处理：
+    - sigmoid 得到 HOI/OBJ 分数
+    - 将预测的归一化 box 映射到原图尺寸（absolute xyxy）
+    - 拼接 subject/object 的 labels 与 boxes，并返回 query 对应的 sub_id/obj_id
+    """
 
     def __init__(self, args):
         super().__init__()
@@ -536,6 +644,7 @@ class PostProcessHOITriplet(nn.Module):
 
 
 def build(args):
+    # 构建：backbone + GEN + matcher + criterion + postprocessor
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
