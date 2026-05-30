@@ -16,12 +16,12 @@ fi
 conda activate rlip2
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-MASTER_PORT="${MASTER_PORT:-29502}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 DATA_ROOT="${DATA_ROOT:-../VidHOI}"
 PRETRAINED="${PRETRAINED:-output/detr_r50.pth}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-output}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./output}"
 EPOCHS="${EPOCHS:-90}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 LR_DROP="${LR_DROP:-60}"
 BACKBONE="${BACKBONE:-resnet50}"
 RESUME="${RESUME:-}"
@@ -80,4 +80,5 @@ python -m torch.distributed.run \
     --verb_pth ./tmp/verb.pth \
     --training_free_enhancement_path ./training_free_ehnahcement/ \
     --train_ratio "${TRAIN_RATIO}" \
-    ${RESUME:+--resume "${RESUME}"}
+    ${RESUME:+--resume "${RESUME}"} \
+    "$@"

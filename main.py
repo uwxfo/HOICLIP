@@ -31,9 +31,9 @@ def setup_seed(seed):
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--lr_clip', default=1e-5, type=float)
+    parser.add_argument('--lr', default=2e-4, type=float)
+    parser.add_argument('--lr_backbone', default=2e-5, type=float)
+    parser.add_argument('--lr_clip', default=2e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=150, type=int)
@@ -423,7 +423,7 @@ def main(args):
     print('dataloader finished')
 
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        checkpoint = torch.load(args.frozen_weights, map_location='cpu', weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     # output_dir is already set correctly above; re-derive from args.output_dir
@@ -445,7 +445,7 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -456,11 +456,8 @@ def main(args):
         #     amp.load_state_dict(checkpoint['amp'])
 
     elif args.pretrained:
-        checkpoint = torch.load(args.pretrained, map_location='cpu')
-        if args.eval:
-            model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
-        else:
-            model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
 
     if args.eval:
         if not os.path.exists(output_dir / "log.txt"):
@@ -596,7 +593,7 @@ def main(args):
 
         if epoch == args.epochs - 1 and os.path.exists(os.path.join(output_dir, 'checkpoint_best.pth')):
             print('Loading best val checkpoint!')
-            checkpoint = torch.load(os.path.join(output_dir, 'checkpoint_best.pth'), map_location='cpu')
+            checkpoint = torch.load(os.path.join(output_dir, 'checkpoint_best.pth'), map_location='cpu', weights_only=False)
             model_without_ddp.load_state_dict(checkpoint['model'])
             if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer'])

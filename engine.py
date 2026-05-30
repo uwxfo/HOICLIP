@@ -202,7 +202,7 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
     """
     root = os.path.join(args.output_dir, args.training_free_enhancement_path)
     if args.training_free_enhancement_path:
-
+        os.makedirs(root, exist_ok=True)
         with open(os.path.join(root, 'log.txt'), 'a') as f:
             log = f'\n=========The great hyperparameter tuning begins============\n'
             print(log)
@@ -224,12 +224,13 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                                            use_nms_filter=args.use_nms_filter)
         stats = evaluator.evaluate()
 
-        text_hoi_feature = model.transformer.hoi_cls
+        _model = model.module if hasattr(model, 'module') else model
+        text_hoi_feature = _model.transformer.hoi_cls
         spatial_feature = torch.cat([i['clip_visual'].unsqueeze(0) for i in preds])
         spatial_feature /= spatial_feature.norm(dim=-1, keepdim=True)
         spatial_cls = spatial_feature[:, 0, :]  # M, c
 
-        cls_scores = spatial_cls @ text_hoi_feature
+        cls_scores = spatial_cls @ text_hoi_feature.to(spatial_cls.device).T
         with open(os.path.join(root, 'log.txt'), 'a') as f:
             log = f'\n=========Baseline Performance============\n{stats}\n============================\n'
             print(log)
@@ -258,7 +259,10 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                         evaluator = HICOEvaluator_gen(test_pred, gts, data_loader.dataset.rare_triplets,
                                                       data_loader.dataset.non_rare_triplets,
                                                       data_loader.dataset.correct_mat, args=args)
-
+                    elif dataset_file == 'vidhoi':
+                        evaluator = VidHOIEvaluator(test_pred, gts, use_nms_filter=args.use_nms_filter,
+                                                    thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
+                                                    nms_beta=args.nms_beta)
                     else:
                         evaluator = VCOCOEvaluator_gen(test_pred, gts, data_loader.dataset.correct_mat,
                                                        use_nms_filter=args.use_nms_filter)
