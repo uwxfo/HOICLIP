@@ -17,18 +17,28 @@ conda activate rlip2
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 MASTER_PORT="${MASTER_PORT:-29502}"
-DATA_ROOT="${DATA_ROOT:-/mnt/d/VidHOI}"
-PRETRAINED="${PRETRAINED:-}"
+DATA_ROOT="${DATA_ROOT:-../VidHOI}"
+PRETRAINED="${PRETRAINED:-output/detr_r50.pth}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-output}"
 EPOCHS="${EPOCHS:-90}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 LR_DROP="${LR_DROP:-60}"
 BACKBONE="${BACKBONE:-resnet50}"
 RESUME="${RESUME:-}"
-# Output directory for this experiment
-EXP_DIR="${EXP_DIR:-${OUTPUT_ROOT}/vidhoi_hoiclip}"
-# Fraction of training data to use
 TRAIN_RATIO="${TRAIN_RATIO:-1.0}"
+
+# Run name for organising output directories — mirrors RLIPVISTR's --name convention.
+NAME="${NAME:-hoiclip}"
+
+# Output directory logic (mirrors RLIPVISTR/main.py):
+#   fresh run  → OUTPUT_ROOT/NAME  (HOICLIP's main.py then appends /MMDDHHMI)
+#   resume     → grandparent of checkpoint, so main.py's new timestamp dir is a
+#                sibling of the original run rather than nested inside it
+if [ -n "${RESUME}" ]; then
+    OUTPUT_DIR="$(dirname "$(dirname "${RESUME}")")"
+else
+    OUTPUT_DIR="${OUTPUT_ROOT}/${NAME}"
+fi
 
 if [ ! -e "${DATA_ROOT}/images" ]; then
     echo "Expected ${DATA_ROOT}/images to exist."
@@ -44,7 +54,8 @@ python -m torch.distributed.run \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --master_port="${MASTER_PORT}" \
     main.py \
-    --output_dir "${EXP_DIR}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --name "${NAME}" \
     --dataset_file vidhoi \
     --hoi_path "${DATA_ROOT}" \
     --num_obj_classes 78 \
@@ -57,7 +68,7 @@ python -m torch.distributed.run \
     --use_nms_filter \
     --fix_clip \
     --batch_size "${BATCH_SIZE}" \
-    --pretrained "${PRETRAINED}" \
+    ${PRETRAINED:+--pretrained "${PRETRAINED}"} \
     --with_clip_label \
     --with_obj_clip_label \
     --gradient_accumulation_steps 1 \
@@ -69,3 +80,4 @@ python -m torch.distributed.run \
     --verb_pth ./tmp/verb.pth \
     --training_free_enhancement_path ./training_free_ehnahcement/ \
     --train_ratio "${TRAIN_RATIO}" \
+    ${RESUME:+--resume "${RESUME}"}

@@ -132,7 +132,9 @@ def get_args_parser():
                         help='Fraction of validation annotations to use (VidHOI, unused)')
 
     parser.add_argument('--output_dir', default='',
-                        help='path where to save, empty for no saving')
+                        help='base directory for output; a timestamped subdirectory is created inside')
+    parser.add_argument('--name', default='', type=str,
+                        help='optional run name prepended to the timestamp subdirectory')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
@@ -235,9 +237,27 @@ def main(args):
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
-    timestamp = datetime.datetime.now().strftime("%m%d%H%M")
-    output_dir = Path(args.output_dir) / timestamp
+    # --- output_dir logic (mirrors RLIPVISTR/main.py) ---
+    # eval  → results land next to the loaded checkpoint, in an "eval" subdirectory
+    # resume → continue logging in the same directory as the checkpoint (no new timestamp)
+    # fresh  → create a new timestamped subdirectory under args.output_dir
+    if args.eval:
+        if args.resume and os.path.exists(args.resume):
+            output_dir = Path(args.resume).parent / "eval"
+        elif args.pretrained:
+            output_dir = Path(args.pretrained).parent / "eval"
+        else:
+            output_dir = Path(args.output_dir) / "eval"
+    elif args.resume and os.path.exists(args.resume):
+        output_dir = Path(args.resume).parent
+    else:
+        timestamp = datetime.datetime.now().strftime("%m%d%H%M")
+        run_name = f"{args.name}_{timestamp}" if args.name else timestamp
+        output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Propagate the resolved path back so all later Path(args.output_dir) calls
+    # see the correct (possibly timestamped) directory instead of the base dir.
+    args.output_dir = str(output_dir)
     if args.debug:
         if args.rank == 0:
             debugpy.listen(("0.0.0.0", 5678))
@@ -406,6 +426,8 @@ def main(args):
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
+    # output_dir is already set correctly above; re-derive from args.output_dir
+    # so the variable is available after the early-return eval block.
     output_dir = Path(args.output_dir)
 
     # init logging
