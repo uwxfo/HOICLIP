@@ -135,6 +135,16 @@ def all_gather(data):
     return data_list
 
 
+def broadcast_object(data, src=0):
+    """Broadcast one small Python object and return it on every rank."""
+    if get_world_size() == 1:
+        return data
+
+    object_list = [data]
+    dist.broadcast_object_list(object_list, src=src)
+    return object_list[0]
+
+
 def reduce_dict(input_dict, average=True):
     """
     Args:
@@ -276,6 +286,19 @@ def collate_fn(batch):
     batch = list(zip(*batch))
     batch[0] = nested_tensor_from_tensor_list(batch[0])
     return tuple(batch)
+
+
+def make_clip_collate_fn(T: int):
+    """为 T 帧 clip 数据集生成 collate_fn。
+    每个样本 imgs 为 (T*3, H, W)（T 帧 cat 到 channel 维），
+    collate 后展平为 B*T 张图送入 nested_tensor_from_tensor_list → NestedTensor(B*T, 3, H, W)。
+    """
+    def collate_fn_clip(batch):
+        imgs_batch, targets = list(zip(*batch))
+        # imgs_batch[b] shape: (T*3, H, W)；按 3 切分得到 T 张 (3, H, W)
+        frames = [imgs_batch[b][t * 3:(t + 1) * 3] for b in range(len(imgs_batch)) for t in range(T)]
+        return nested_tensor_from_tensor_list(frames), list(targets)
+    return collate_fn_clip
 
 
 def _max_by_axis(the_list):

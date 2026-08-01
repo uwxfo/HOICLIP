@@ -7,6 +7,11 @@ from .generate_image_feature.generate_verb import build as generate_verb
 def build_model(args):
     if args.model_name == "HOICLIP":
         return build_models_hoiclip(args)
+    elif args.model_name == "HOICLIP_LSTM":
+        from models.models_hoiclip.hoiclip import build as build_hoiclip, HOICLIP_LSTM
+        hoiclip, criterion, postprocessors = build_hoiclip(args)
+        model = HOICLIP_LSTM(hoiclip, args)
+        return model, criterion, postprocessors
     elif args.model_name == "GEN":
         return build_gen(args)
     elif args.model_name == "VISUALIZATION":

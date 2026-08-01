@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import datasets
 import util.misc as utils
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate_hoi
+from engine import train_one_epoch, evaluate_hoi, evaluate_hoi_transition
 from models import build_model
 import os
 
@@ -131,6 +131,28 @@ def get_args_parser():
     parser.add_argument('--val_ratio', default=1.0, type=float,
                         help='Fraction of validation annotations to use (VidHOI, unused)')
 
+    # HOICLIP_LSTM clip-mode arguments
+    parser.add_argument('--max_length', default=6,   type=int,
+                        help='Clip window length T for HOICLIP_LSTM')
+    parser.add_argument('--min_length', default=6,   type=int,
+                        help='Minimum window length for VidHOIVideoDataset')
+    parser.add_argument('--min_future', default=3,   type=int,
+                        help='Minimum future length for VidHOIVideoDataset')
+    parser.add_argument('--sample_mode', default='window', type=str,
+                        choices=['window', 'clip'],
+                        help='Sampling mode for VidHOIVideoDataset')
+    parser.add_argument('--transition_matrix_type', type=str, default=None,
+                        help='Enable transition-matrix anticipation eval and select the triplet '
+                             'matrix variant (e.g. detant, detant_v2, orig). The dataset switches '
+                             'to window clips while the model still sees only the last frame.')
+    parser.add_argument('--lstm_hidden_dim', default=512, type=int,
+                        help='LSTM hidden dimension (defaults to clip_embed_dim)')
+    parser.add_argument('--lstm_num_layers', default=2, type=int,
+                        help='Number of LSTM layers')
+    parser.add_argument('--freeze_temporal', action='store_true',
+                        help='HOICLIP_LSTM cross-dataset linear probe: additionally freeze the '
+                             'LSTM, leaving only curr_hoi_head and future_hoi_heads trainable.')
+
     parser.add_argument('--output_dir', default='',
                         help='base directory for output; a timestamped subdirectory is created inside')
     parser.add_argument('--name', default='', type=str,
@@ -225,7 +247,7 @@ def main(args):
         args.distributed = False
 
     args.save_points = []  # populated via --save_points if the arg is ever added back
-
+    args.anticipation=True
     print('setting up seeds')
     setup_seed(233)
 
@@ -241,17 +263,21 @@ def main(args):
     # eval  → results land next to the loaded checkpoint, in an "eval" subdirectory
     # resume → continue logging in the same directory as the checkpoint (no new timestamp)
     # fresh  → create a new timestamped subdirectory under args.output_dir
+    timestamp = datetime.datetime.now().strftime("%m%d%H%M")
+    '''
     if args.eval:
         if args.resume and os.path.exists(args.resume):
-            output_dir = Path(args.resume).parent / "eval"
+            output_dir = Path(args.resume).parent / "eval" / timestamp 
         elif args.pretrained:
-            output_dir = Path(args.pretrained).parent / "eval"
+            output_dir = Path(args.pretrained).parent / "eval" / timestamp 
         else:
             output_dir = Path(args.output_dir) / "eval"
+    '''
+    if args.eval:
+        output_dir = Path(args.output_dir) / timestamp
     elif args.resume and os.path.exists(args.resume):
         output_dir = Path(args.resume).parent
     else:
-        timestamp = datetime.datetime.now().strftime("%m%d%H%M")
         run_name = f"{args.name}_{timestamp}" if args.name else timestamp
         output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -275,7 +301,15 @@ def main(args):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    model, criterion, postprocessors = build_model(args)
+    # Transition-based eval keeps the model image-based: build (and later load) it as a plain
+    # frame-mode HOICLIP, then restore window mode so the dataset still yields clips.
+    if getattr(args, 'transition_matrix_type', None) is not None:
+        _saved_sample_mode = args.sample_mode
+        args.sample_mode = 'frame'
+        model, criterion, postprocessors = build_model(args)
+        args.sample_mode = _saved_sample_mode
+    else:
+        model, criterion, postprocessors = build_model(args)
     model.to(device)
     print('****************')
     # print(model)
@@ -287,6 +321,13 @@ def main(args):
         if args.enable_amp:
             raise NotImplementedError
         else:
+            # Plain HOICLIP always has params that never receive a gradient in this
+            # training config (CLIP's text encoder — used only once at classifier-weight
+            # init, not in forward — plus interaction_decoder/clip_interaction_decoder,
+            # unused branches unless a different, currently-unused config flag enables
+            # them). This is dataset-independent — it reproduces identically for
+            # dataset_file=vidhoi — and crashes DDP's gradient-bucket check on the second
+            # iteration without this flag.
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
             model_without_ddp = model.module
 
@@ -306,7 +347,14 @@ def main(args):
             if 'obj_visual_projection' in name or 'visual_projection' in name:
                 p.requires_grad = True
 
-    if args.ft_clip_with_small_lr:
+    # HOICLIP_LSTM：HOICLIP 已冻结，只优化 LSTM + 预测头
+    if args.model_name == 'HOICLIP_LSTM':
+        param_dicts = [
+            {"params": [p for p in model_without_ddp.parameters() if p.requires_grad]}
+        ]
+        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
+                                      weight_decay=args.weight_decay)
+    elif args.ft_clip_with_small_lr:
         if args.with_obj_clip_label and args.with_clip_label:
             param_dicts = [
                 {"params": [p for n, p in model_without_ddp.named_parameters() if
@@ -370,8 +418,9 @@ def main(args):
                 "lr": args.lr_backbone,
             },
         ]
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    if args.model_name != 'HOICLIP_LSTM':
+        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
+                                      weight_decay=args.weight_decay)
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -401,8 +450,15 @@ def main(args):
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
 
+    # HOICLIP_LSTM 用自定义 collate_fn（T 帧 channel 拼接 → B*T NestedTensor）
+    if args.model_name == 'HOICLIP_LSTM' or getattr(args, 'transition_matrix_type', None) is not None:
+        from util.misc import make_clip_collate_fn
+        _collate = make_clip_collate_fn(args.max_length)
+    else:
+        _collate = utils.collate_fn
+
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn, num_workers=args.num_workers)
+                                   collate_fn=_collate, num_workers=args.num_workers)
 
     # test and val dataloader initialization
 
@@ -417,9 +473,9 @@ def main(args):
         sampler_test = torch.utils.data.SequentialSampler(dataset_test)
 
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+                                 drop_last=False, collate_fn=_collate, num_workers=args.num_workers)
     data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
-                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+                                  drop_last=False, collate_fn=_collate, num_workers=args.num_workers)
     print('dataloader finished')
 
     if args.frozen_weights is not None:
@@ -446,18 +502,63 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
+        ckpt_model = checkpoint['model']
+        current_keys = set(model_without_ddp.state_dict().keys())
+        ckpt_keys = set(ckpt_model.keys())
+        # If there is no key overlap, try prefixing with 'hoiclip.' to handle
+        # loading a plain HOICLIP checkpoint into HOICLIP_LSTM (which wraps
+        # HOICLIP as self.hoiclip).
+        arch_changed = not bool(current_keys & ckpt_keys)
+        if arch_changed:
+            remapped = {'hoiclip.' + k: v for k, v in ckpt_model.items()}
+            if current_keys & set(remapped.keys()):
+                ckpt_model = remapped
+        if arch_changed:
+            # Architecture differs: load what we can, skip optimizer state.
+            model_without_ddp.load_state_dict(ckpt_model, strict=False)
+        else:
+            model_without_ddp.load_state_dict(ckpt_model)
+            if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                args.start_epoch = checkpoint['epoch'] + 1
 
         # if args.enable_amp:
         #     amp.load_state_dict(checkpoint['amp'])
 
     elif args.pretrained:
         checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        ckpt_model = checkpoint['model']
+        model_sd = model_without_ddp.state_dict()
+        # A plain HOICLIP checkpoint loaded into HOICLIP_LSTM needs the 'hoiclip.' prefix,
+        # since the LSTM model wraps HOICLIP as self.hoiclip. A *_LSTM checkpoint already
+        # has matching names. (Same remap the --resume branch above performs.)
+        if not (set(model_sd) & set(ckpt_model)):
+            remapped = {'hoiclip.' + k: v for k, v in ckpt_model.items()}
+            if set(model_sd) & set(remapped):
+                ckpt_model = remapped
+        # Cross-dataset transfer changes the HOI/object label space, so the CLIP-initialised
+        # projections and the LSTM heads no longer line up. Drop them and keep the build-time
+        # initialisation (which already encodes the *target* dataset's prompts with CLIP).
+        # load_state_dict(strict=False) tolerates missing/unexpected keys but not shape mismatch.
+        dropped = [k for k, v in ckpt_model.items()
+                   if k in model_sd and model_sd[k].shape != v.shape]
+        if dropped:
+            ckpt_model = {k: v for k, v in ckpt_model.items() if k not in dropped}
+            print(f'Dropped {len(dropped)} shape-mismatched keys (kept their fresh init): {dropped}')
+        info = model_without_ddp.load_state_dict(ckpt_model, strict=False)
+        print(f'Loaded {args.pretrained}\n  missing: {len(info.missing_keys)}'
+              f' | unexpected: {len(info.unexpected_keys)}')
+
+    if args.eval and getattr(args, 'transition_matrix_type', None) is not None:
+        # Single pass over the val clips; the per-horizon metrics come back suffixed _f1/_f3/_f5/_f7.
+        test_stats = evaluate_hoi_transition(args.dataset_file, model, postprocessors,
+                                             data_loader_val, args.subject_category_id, device, args)
+        if args.output_dir and utils.is_main_process():
+            with (output_dir / "log.jsonl").open("a") as f:
+                f.write(json.dumps(test_stats) + "\n")
+        print(json.dumps(test_stats))
+        return
 
     if args.eval:
         if not os.path.exists(output_dir / "log.txt"):
@@ -472,18 +573,22 @@ def main(args):
                                       args.subject_category_id, device, args)
 
             if args.output_dir and utils.is_main_process():
-                #  add eval in log for my convenience
                 with (output_dir / "log.txt").open("a") as f:
                     f.write('Test result:' + json.dumps(test_stats) + "\n")
                 LOGGER.info('Epoch Test: [{}] '.format('eval') + json.dumps(test_stats))
+                # When test_split == 'val', test and val loaders are identical;
+                # reuse the result to avoid a redundant second full evaluation.
+                if test_split == 'val' and 'Val result:' not in previous_log:
+                    with (output_dir / "log.txt").open("a") as f:
+                        f.write('Val result:' + json.dumps(test_stats) + "\n")
+                    LOGGER.info('Epoch Val: [{}] '.format('eval') + json.dumps(test_stats))
 
-        if 'Val result:' not in previous_log:
+        if 'Val result:' not in previous_log and test_split != 'val':
             print('Evaluating in val split!')
             test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val,
                                       args.subject_category_id, device, args)
 
             if args.output_dir and utils.is_main_process():
-                #  add eval in log for my convenience
                 with (output_dir / "log.txt").open("a") as f:
                     f.write('Val result:' + json.dumps(test_stats) + "\n")
                 LOGGER.info('Epoch Val: [{}] '.format('eval') + json.dumps(test_stats))
@@ -500,7 +605,7 @@ def main(args):
                 performance = test_stats['mAP']
             elif args.dataset_file == 'vcoco':
                 performance = test_stats['mAP_all']
-            elif args.dataset_file in ('hoia', 'vidhoi'):
+            elif args.dataset_file in ('hoia', 'vidhoi', 'ag'):
                 performance = test_stats['mAP']
             best_performance = performance
         except:
@@ -517,31 +622,13 @@ def main(args):
             args.gradient_accumulation_steps, args.enable_amp, args.no_training, args)
 
         lr_scheduler.step()
-        # if epoch == args.epochs - 1:
-        checkpoint_path = os.path.join(output_dir, 'checkpoint_last.pth')
-        utils.save_on_master({
-                                 'model': model_without_ddp.state_dict(),
-                                 'optimizer': optimizer.state_dict(),
-                                 'lr_scheduler': lr_scheduler.state_dict(),
-                                 # 'amp': amp.state_dict(),
-                                 'epoch': epoch,
-                                 'args': args,
-                             } if args.enable_amp else {
-            'model': model_without_ddp.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'lr_scheduler': lr_scheduler.state_dict(),
-            # 'amp': None,
-            'epoch': epoch,
-            'args': args,
-        }, checkpoint_path)
-
         test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val,
                                   args.subject_category_id, device, args)
         if args.dataset_file == 'hico':
             performance = test_stats['mAP']
         elif args.dataset_file == 'vcoco':
             performance = test_stats['mAP_all']
-        elif args.dataset_file in ('hoia', 'vidhoi'):
+        elif args.dataset_file in ('hoia', 'vidhoi', 'ag'):
             performance = test_stats['mAP']
         else:
             performance = 0.0
@@ -590,6 +677,42 @@ def main(args):
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(test_stats) + "\n")
             LOGGER.info('Epoch: [{}] '.format(epoch) + json.dumps(test_stats))
+
+        # 验证和日志成功完成后才推进断点，避免中断验证时恢复后跳过该轮指标。
+        checkpoint_path = os.path.join(output_dir, 'checkpoint_last.pth')
+        utils.save_on_master({
+                                 'model': model_without_ddp.state_dict(),
+                                 'optimizer': optimizer.state_dict(),
+                                 'lr_scheduler': lr_scheduler.state_dict(),
+                                 # 'amp': amp.state_dict(),
+                                 'epoch': epoch,
+                                 'args': args,
+                             } if args.enable_amp else {
+            'model': model_without_ddp.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            # 'amp': None,
+            'epoch': epoch,
+            'args': args,
+        }, checkpoint_path)
+
+        if epoch % 10 == 0:
+            checkpoint_path = os.path.join(output_dir, 'checkpoint_{:04d}.pth'.format(epoch))
+            utils.save_on_master({
+                                        'model': model_without_ddp.state_dict(),
+                                        'optimizer': optimizer.state_dict(),
+                                        'lr_scheduler': lr_scheduler.state_dict(),
+                                        # 'amp': amp.state_dict(),
+                                        'epoch': epoch,
+                                        'args': args,
+                                    } if args.enable_amp else {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                # 'amp': None,
+                'epoch': epoch,
+                'args': args,
+            }, checkpoint_path)
 
         if epoch == args.epochs - 1 and os.path.exists(os.path.join(output_dir, 'checkpoint_best.pth')):
             print('Loading best val checkpoint!')

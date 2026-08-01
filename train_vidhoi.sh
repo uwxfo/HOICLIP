@@ -16,16 +16,21 @@ fi
 conda activate rlip2
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-MASTER_PORT="${MASTER_PORT:-29500}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 DATA_ROOT="${DATA_ROOT:-../VidHOI}"
-PRETRAINED="${PRETRAINED:-output/detr_r50.pth}"
+PRETRAINED="${PRETRAINED:-output/hoiclip/hoiclip_05301154/checkpoint_best.pth}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./output}"
-EPOCHS="${EPOCHS:-90}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
-LR_DROP="${LR_DROP:-60}"
+EPOCHS="${EPOCHS:-50}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+LR_DROP="${LR_DROP:-30}"
 BACKBONE="${BACKBONE:-resnet50}"
 RESUME="${RESUME:-}"
+#RESUME="${RESUME:-output/hoiclip/hoiclip_05301154/checkpoint_best.pth}"
 TRAIN_RATIO="${TRAIN_RATIO:-1.0}"
+# Empty by default: enables only the final mAP eval.
+# Set to a path (e.g. ./training_free_ehnahcement/) to also run the topk
+# hyperparameter search loop (adds 6 extra full-dataset evaluations — slow).
+ENHANCEMENT_PATH="${ENHANCEMENT_PATH:-}"
 
 # Run name for organising output directories — mirrors RLIPVISTR's --name convention.
 NAME="${NAME:-hoiclip}"
@@ -78,7 +83,7 @@ python -m torch.distributed.run \
     --model_name HOICLIP \
     --zero_shot_type default \
     --verb_pth ./tmp/verb.pth \
-    --training_free_enhancement_path ./training_free_ehnahcement/ \
+    ${ENHANCEMENT_PATH:+--training_free_enhancement_path "${ENHANCEMENT_PATH}"} \
     --train_ratio "${TRAIN_RATIO}" \
     ${RESUME:+--resume "${RESUME}"} \
     "$@"

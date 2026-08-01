@@ -20,6 +20,33 @@ import datetime
 import time
 
 
+def _prepare_hoi_eval_batch(results, targets, keep_clip_visual=False):
+    """Drop tensors that are not consumed by the HOI evaluators before gathering."""
+    compact_results = []
+    for result in results:
+        result = dict(result)
+        result.pop('clip_logits', None)
+        if not keep_clip_visual:
+            result.pop('clip_visual', None)
+        compact_results.append(result)
+
+    # clip_inputs is an image tensor used by model.forward, not by any evaluator.
+    compact_targets = [
+        {k: v for k, v in target.items() if k not in ('clip_inputs', 'raw_img')}
+        for target in targets
+    ]
+    return compact_results, compact_targets
+
+
+def _gather_hoi_eval_batch_on_main(results, targets, preds, gts):
+    """Run the required collectives on every rank but retain global data only on rank 0."""
+    gathered_results = utils.all_gather(results)
+    gathered_targets = utils.all_gather(targets)
+    if utils.is_main_process():
+        preds.extend(itertools.chain.from_iterable(gathered_results))
+        gts.extend(itertools.chain.from_iterable(gathered_targets))
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, lr_scheduler=None,
@@ -47,7 +74,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         if no_training:
             samples = samples.to(device)
-            targets = [{k: v.to(device) for k, v in t.items() if k != 'filename' and k != 'raw_img'} for t in targets]
+            targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items() if k != 'filename' and k != 'raw_img'} for t in targets]
             clip_img = torch.stack([v['clip_inputs'] for v in targets])
             # with autocast():
             obj_feature, hoi_feature, verb_feature = model(samples, clip_input=clip_img, targets=targets)
@@ -64,7 +92,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         samples = samples.to(device)
         file_names = [{'filename': i['filename']} for i in targets]
-        targets = [{k: v.to(device) for k, v in t.items() if k != 'filename' and k != 'raw_img'} for t in targets]
+        targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items() if k != 'filename' and k != 'raw_img'} for t in targets]
         for t, f in zip(targets, file_names):
             t.update(f)
         clip_img = torch.stack([v['clip_inputs'] for v in targets])
@@ -181,15 +210,22 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['hoi'](outputs, orig_target_sizes)
 
-        preds.extend(list(itertools.chain.from_iterable(utils.all_gather(results))))
-        # For avoiding a runtime error, the copy is used
-        gts.extend(list(itertools.chain.from_iterable(utils.all_gather(copy.deepcopy(targets)))))
+        results, eval_targets = _prepare_hoi_eval_batch(
+            results, targets,
+            keep_clip_visual=bool(args.training_free_enhancement_path),
+        )
+        _gather_hoi_eval_batch_on_main(results, eval_targets, preds, gts)
 
         counter += 1
         if counter >= 20 and args.no_training:
             break
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+
+    # Only rank 0 retained the global predictions. Other ranks wait here while rank 0
+    # computes mAP, then receive the small stats dictionary via broadcast.
+    if not utils.is_main_process():
+        return utils.broadcast_object(None)
 
     img_ids = [img_gts['id'] for img_gts in gts]
     _, indices = np.unique(img_ids, return_index=True)
@@ -215,8 +251,11 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
             evaluator = HICOEvaluator_gen(test_pred, gts, data_loader.dataset.rare_triplets,
                                           data_loader.dataset.non_rare_triplets,
                                           data_loader.dataset.correct_mat, args=args)
-        elif dataset_file == 'vidhoi':
-            evaluator = VidHOIEvaluator(test_pred, gts, use_nms_filter=args.use_nms_filter,
+        elif dataset_file in ('vidhoi', 'ag'):
+            # 调参场景不传 output_dir：per-triplet AP 明细只由下面的主评估写盘，
+            # 否则这里的 baseline 和 topk 循环会反复覆盖同名 json。
+            evaluator = VidHOIEvaluator(test_pred, gts, args.hoi_path,
+                                        use_nms_filter=args.use_nms_filter,
                                         thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
                                         nms_beta=args.nms_beta)
         else:
@@ -225,7 +264,9 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         stats = evaluator.evaluate()
 
         _model = model.module if hasattr(model, 'module') else model
-        text_hoi_feature = _model.transformer.hoi_cls
+        # HOICLIP_LSTM wraps HOICLIP as self.hoiclip; fall back to that if needed.
+        _inner = getattr(_model, 'hoiclip', _model)
+        text_hoi_feature = _inner.transformer.hoi_cls
         spatial_feature = torch.cat([i['clip_visual'].unsqueeze(0) for i in preds])
         spatial_feature /= spatial_feature.norm(dim=-1, keepdim=True)
         spatial_cls = spatial_feature[:, 0, :]  # M, c
@@ -242,7 +283,7 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                 for topk in [10, 20, 30, 40, 50]:
                     print(f'current at topk: {topk} as: {a}')
                     test_pred = copy.deepcopy(preds)
-                    clip_hoi_score = cls_scores
+                    clip_hoi_score = cls_scores.clone()  # 避免原地修改 cls_scores
                     # clip_hoi_score /= (1 + alpha + beta)
                     clip_hoi_score_ori = clip_hoi_score.clone()
 
@@ -259,8 +300,9 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                         evaluator = HICOEvaluator_gen(test_pred, gts, data_loader.dataset.rare_triplets,
                                                       data_loader.dataset.non_rare_triplets,
                                                       data_loader.dataset.correct_mat, args=args)
-                    elif dataset_file == 'vidhoi':
-                        evaluator = VidHOIEvaluator(test_pred, gts, use_nms_filter=args.use_nms_filter,
+                    elif dataset_file in ('vidhoi', 'ag'):
+                        evaluator = VidHOIEvaluator(test_pred, gts, args.hoi_path,
+                                                    use_nms_filter=args.use_nms_filter,
                                                     thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
                                                     nms_beta=args.nms_beta)
                     else:
@@ -271,7 +313,7 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                         re_map = stats['mAP']
                     elif dataset_file == 'vcoco':
                         re_map = stats['mAP_all']
-                    elif dataset_file in ('hoia', 'vidhoi'):
+                    elif dataset_file in ('hoia', 'vidhoi', 'ag'):
                         re_map = stats['mAP']
                     else:
                         raise NotImplementedError
@@ -294,16 +336,144 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         if args.dataset_root == 'GEN':
             evaluator = VCOCOEvaluator_gen(preds, gts, data_loader.dataset.correct_mat,
                                            use_nms_filter=args.use_nms_filter)
-    elif dataset_file == 'vidhoi':
-        evaluator = VidHOIEvaluator(preds, gts, use_nms_filter=args.use_nms_filter,
+    elif dataset_file in ('vidhoi', 'ag'):
+        # 只有 --eval 模式才落 per-triplet AP 明细；训练中每 epoch 都会走到这里，
+        # 写盘只会被下个 epoch 覆盖。汇总指标（mAP/mAP_rare/...）始终随 stats 返回。
+        evaluator = VidHOIEvaluator(preds, gts, args.hoi_path,
+                                    use_nms_filter=args.use_nms_filter,
                                     thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
-                                    nms_beta=args.nms_beta)
+                                    nms_beta=args.nms_beta,
+                                    output_dir=args.output_dir if args.eval else "")
     else:
         raise NotImplementedError
+    print(f'Evaluating {len(preds)} frames...')
     start_time = time.time()
     stats = evaluator.evaluate()
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Total time computing mAP: {}'.format(total_time_str))
 
-    return stats
+    return utils.broadcast_object(stats)
+
+
+# Queries processed at once in the noise-OR propagation; bounds the [q, N_hoi, N_hoi] GPU
+# temporary (at N_hoi=1127, chunk=32 -> ~163MB, trivial for a modern GPU).
+_NOISE_OR_QUERY_CHUNK = 32
+
+
+@torch.no_grad()
+def evaluate_hoi_transition(dataset_file, model, postprocessors, data_loader,
+                            subject_category_id, device, args):
+    """
+    Evaluate HOICLIP with a triplet transition matrix for future-horizon anticipation.
+
+    The dataset yields window clips, but the model stays image-based: only the clip's
+    last frame is fed to it. Current-frame HOI scores are then propagated to future
+    horizons [1,3,5,7] with a noise-OR over the triplet transition matrix.
+    """
+    from datasets.priors.transition_matrix_triplet import extract_transition_matrix
+
+    model.eval()
+
+    # Trans[h]: [N_hoi, N_hoi] with T[i, j] = P(current triplet i | future triplet j).
+    # Kept on `device` since the noise-OR propagation below runs on GPU.
+    Trans = {k: torch.as_tensor(v, dtype=torch.float32, device=device)
+             for k, v in extract_transition_matrix(args.transition_matrix_type).items()}
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    print("It is running evaluate_hoi_transition......")
+
+    preds = []
+    gts = []
+
+    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+        # collate gives NestedTensor(B*T, 3, H, W); keep the last frame of every clip
+        src, mask = samples.decompose()
+        n, c, h, w = src.shape
+        assert n % args.max_length == 0, f"{n} must be divisible by max_length"
+        bs = n // args.max_length
+        src_last = src.reshape(bs, -1, c, h, w)[:, -1, ...]   # [bs, 3, H, W]
+        mask_last = mask.reshape(bs, -1, h, w)[:, -1, ...]    # [bs, H, W]
+        samples = utils.NestedTensor(src_last, mask_last).to(device)
+
+        # clip_inputs is (T, 3, 224, 224) per clip -> take the same last frame
+        clip_img = torch.stack([v['clip_inputs'][-1] for v in targets]).to(device)
+
+        outputs = model(samples, is_training=False, clip_input=clip_img, targets=targets)
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = postprocessors['hoi'](outputs, orig_target_sizes)
+
+        results, eval_targets = _prepare_hoi_eval_batch(results, targets)
+        _gather_hoi_eval_batch_on_main(results, eval_targets, preds, gts)
+
+    metric_logger.synchronize_between_processes()
+
+    if not utils.is_main_process():
+        return utils.broadcast_object(None)
+
+    img_ids = [img_gts['id'] for img_gts in gts]
+    _, indices = np.unique(img_ids, return_index=True)
+    preds = [img_preds for i, img_preds in enumerate(preds) if i in indices]
+    gts = [img_gts for i, img_gts in enumerate(gts) if i in indices]
+
+    def _make_evaluator(p, g, output_dir=""):
+        return VidHOIEvaluator(p, g, args.hoi_path,
+                               use_nms_filter=args.use_nms_filter,
+                               thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
+                               nms_beta=args.nms_beta, output_dir=output_dir)
+
+    horizons = [1, 3, 5, 7]
+    preds_future = [[] for _ in horizons]
+    gts_future = [[] for _ in horizons]
+
+    for pred, gt in zip(preds, gts):
+        if 'future' not in gt:
+            continue
+        hoi_scores = pred['hoi_scores']            # [Q, N_hoi]
+        for f, hois in zip(gt['future'], gt['hois_future']):
+            idx = horizons.index(f)
+            T = Trans[f]
+            if T.shape[0] != hoi_scores.shape[1]:
+                raise ValueError(
+                    f"transition matrix for horizon {f} is {tuple(T.shape)} but the model "
+                    f"predicts {hoi_scores.shape[1]} HOI classes")
+            # noise-OR: P_future[q,j] = 1 - prod_i(1 - T[i,j] * hoi_scores[q,i])
+            # Computed on `device` (T already lives there); the [q, N_hoi, N_hoi]
+            # intermediate is ~325MB at q=64/N_hoi=1127, so chunk over queries to keep
+            # peak GPU memory bounded. Result is moved back to CPU for storage since
+            # thousands of these accumulate in preds_future across the full val set.
+            chunks = []
+            for start in range(0, hoi_scores.shape[0], _NOISE_OR_QUERY_CHUNK):
+                s = hoi_scores[start:start + _NOISE_OR_QUERY_CHUNK].to(device)
+                terms = 1.0 - T.unsqueeze(0) * s.unsqueeze(2)   # [q, N_hoi, N_hoi]
+                chunks.append((1.0 - terms.prod(dim=1)).cpu())  # [q, N_hoi]
+            future_hoi_scores = torch.cat(chunks, dim=0)        # [Q, N_hoi]
+
+            p_future = copy.deepcopy(pred)
+            p_future['hoi_scores'] = future_hoi_scores
+            # VidHOIEvaluator reads GT hois as a numeric (N,3) tensor, but hois_future
+            # is a list of dicts -> convert here rather than touching the evaluator.
+            g_future = {
+                'boxes': gt['boxes'], 'labels': gt['labels'], 'id': gt['id'],
+                'filename': gt.get('filename', ''),
+                'hois': torch.as_tensor(
+                    [(x['subject_id'], x['object_id'], x['category_id']) for x in hois],
+                    dtype=torch.int64),
+            }
+            preds_future[idx].append(p_future)
+            gts_future[idx].append(g_future)
+
+    print(f'Detection: evaluating {len(preds)} clips...')
+    # 只有当前帧检测这一路写 AP 明细；4 个 future horizon 共用同一目录，写了会互相覆盖。
+    stats = _make_evaluator(preds, gts, output_dir=args.output_dir).evaluate()
+
+    for f, p_f, g_f in zip(horizons, preds_future, gts_future):
+        if not p_f:
+            print("No items in future ", f)
+            continue
+        print(f"future {f}: totally {len(p_f)} items")
+        stats_f = _make_evaluator(p_f, g_f).evaluate()
+        stats.update({k + f'_f{f}': v for k, v in stats_f.items()})
+
+    return utils.broadcast_object(stats)

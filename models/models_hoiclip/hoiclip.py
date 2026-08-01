@@ -26,6 +26,7 @@ from datasets.hico_text_label import hico_text_label, hico_obj_text_label, hico_
 from datasets.vcoco_text_label import vcoco_hoi_text_label, vcoco_obj_text_label
 from datasets.static_hico import HOI_IDX_TO_ACT_IDX
 from datasets.vidhoi_text_label import vidhoi_text_label, vidhoi_obj_text_label
+from datasets.ag_text_label import ag_text_label, ag_obj_text_label
 
 from ..backbone import build_backbone
 from ..matcher import build_matcher
@@ -97,6 +98,10 @@ class HOICLIP(nn.Module):
             # append a "nothing" class so num_obj_classes = len(vidhoi_obj_text_label)
             obj_text_label = vidhoi_obj_text_label + [(len(vidhoi_obj_text_label), 'a photo of nothing')]
             unseen_index = None
+        elif self.args.dataset_file == 'ag':
+            hoi_text_label = ag_text_label
+            obj_text_label = ag_obj_text_label + [(len(ag_obj_text_label), 'a photo of nothing')]
+            unseen_index = None
 
         # 使用 CLIP 文本编码器初始化分类器权重（可选对 unseen 类做删除/分支初始化）。
         clip_label, obj_clip_label, v_linear_proj_weight, hoi_text, obj_text, train_clip_label = \
@@ -128,10 +133,11 @@ class HOICLIP(nn.Module):
             self.verb_projection = nn.Linear(args.clip_embed_dim, 117, bias=False)
             self.verb_projection.weight.data = torch.load(args.verb_pth, map_location='cpu')
             self.verb_weight = args.verb_weight
-        elif self.args.dataset_file == 'vidhoi':
+        elif self.args.dataset_file in ('vidhoi', 'ag'):
             # verb2hoi_proj[v][hoi_idx] = 1 when HOI class hoi_idx has verb v.
             # Shape: (num_verb_classes, num_hoi_classes)
-            text_label_ids = list(vidhoi_text_label.keys())
+            text_label_ids = list((vidhoi_text_label if self.args.dataset_file == 'vidhoi'
+                                   else ag_text_label).keys())
             n_verb = args.num_verb_classes
             n_hoi = len(text_label_ids)
             verb2hoi_proj = torch.zeros(n_verb, n_hoi)
@@ -641,6 +647,134 @@ class PostProcessHOITriplet(nn.Module):
                                 'sub_ids': ids[:ids.shape[0] // 2], 'obj_ids': ids[ids.shape[0] // 2:], 'clip_logits': clip_logits[index].to('cpu')})
 
         return results
+
+
+class HOICLIP_LSTM(nn.Module):
+    """
+    在冻结 HOICLIP 基础上附加 LSTM 时序建模。
+
+    架构：
+      1. 冻结 HOICLIP：逐帧提取交互特征 hoi_feature (B, Q, clip_embed_dim)。
+      2. LSTM：对 T 帧的 hoi_feature 序列（按 query 独立建模）做时序聚合。
+      3. 当前帧预测头：LSTM 最后输出 → HOI logits。
+      4. 未来预测头（×4）：分别预测未来 h=1,3,5,7 帧的 HOI logits。
+
+    forward 输入：
+      samples_list   : list[NestedTensor], 长度 T，每个 (B, C, H, W)
+      clip_inputs_list: list[Tensor], 长度 T，CLIP 预处理图像 (B, 3, 224, 224)
+      targets_list   : list[list[dict]], 长度 T，每帧的 target 列表（训练时使用）
+      target_sizes   : Tensor (B, 2)，最后一帧的原图尺寸
+
+    forward 输出（兼容 PostProcessHOITriplet 与原有 criterion）：
+      pred_hoi_logits      : (B, Q, N_hoi)  — 当前帧 LSTM 增强后的预测
+      pred_obj_logits      : 来自最后帧 HOICLIP 输出
+      pred_sub_boxes       : 来自最后帧 HOICLIP 输出
+      pred_obj_boxes       : 来自最后帧 HOICLIP 输出
+      future_hoi_logits    : list[Tensor(B, Q, N_hoi)], 长度 4，对应 h=1,3,5,7
+      clip_visual / clip_logits: 来自最后帧 HOICLIP 输出
+    """
+
+    FUTURES = [1, 3, 5, 7]
+
+    def __init__(self, hoiclip: HOICLIP, args):
+        super().__init__()
+        # 冻结 HOICLIP 全部参数
+        self.hoiclip = hoiclip
+        for p in self.hoiclip.parameters():
+            p.requires_grad_(False)
+
+        clip_embed_dim = args.clip_embed_dim
+        lstm_hidden    = getattr(args, 'lstm_hidden_dim', clip_embed_dim)
+        lstm_layers    = getattr(args, 'lstm_num_layers', 1)
+        # with_clip_label=False 时退化为 hoi_class_embedding
+        if hasattr(hoiclip, 'visual_projection'):
+            num_hoi = hoiclip.visual_projection.out_features
+        else:
+            num_hoi = hoiclip.hoi_class_embedding.out_features
+
+        # T：clip 窗口长度，由 args.max_length 提供
+        self.T = args.max_length
+
+        self.lstm = nn.LSTM(clip_embed_dim, lstm_hidden, lstm_layers, batch_first=False)
+        self.curr_hoi_head = nn.Linear(lstm_hidden, num_hoi)
+        self.future_hoi_heads = nn.ModuleList([
+            nn.Linear(lstm_hidden, num_hoi) for _ in self.FUTURES
+        ])
+
+        # Cross-dataset linear probe: keep the temporal dynamics learnt on the source
+        # dataset and re-learn only the five classifier heads on the new label space.
+        self.freeze_temporal = getattr(args, 'freeze_temporal', False)
+        if self.freeze_temporal:
+            for p in self.lstm.parameters():
+                p.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.hoiclip.eval()  # frozen backbone always stays in eval
+        if self.freeze_temporal:
+            # Keep the frozen LSTM in eval so its features stay deterministic
+            # for the linear probe fitted on top of them.
+            self.lstm.eval()
+        return self
+
+    def forward(self, samples, is_training=True, clip_input=None, targets=None):
+        """
+        与 HOICLIP.forward 签名一致，engine.py 无需改动。
+
+        samples   : NestedTensor  (B*T, 3, H, W)
+        clip_input: Tensor (B, T, 3, 224, 224) 或 (B*T, 3, 224, 224) 或 None
+        targets   : list[B dicts]，仅 criterion 在 forward 外使用，此处忽略
+        """
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+
+        T    = self.T
+        B_T  = samples.tensors.shape[0]
+        B    = B_T // T
+
+        # 按帧拆分 NestedTensor：(B*T, ...) → T × (B, ...)
+        tensors_t = samples.tensors.chunk(T, dim=0)   # T × (B, 3, H, W)
+        masks_t   = samples.mask.chunk(T, dim=0)      # T × (B, H, W)
+
+        # 拆分 clip_input
+        if clip_input is not None:
+            if clip_input.dim() == 5:                  # (B, T, 3, 224, 224)
+                clip_flat = clip_input.reshape(B * T, *clip_input.shape[2:])
+            else:                                      # (B*T, 3, 224, 224)
+                clip_flat = clip_input
+            clip_t = clip_flat.chunk(T, dim=0)
+        else:
+            clip_t = [None] * T
+
+        # 逐帧过冻结 HOICLIP，提取 hoi_feature
+        hoi_features = []
+        last_out = None
+        for t in range(T):
+            nt = NestedTensor(tensors_t[t], masks_t[t])
+            with torch.no_grad():
+                out = self.hoiclip(nt, is_training=is_training, clip_input=clip_t[t])
+            hoi_features.append(out['hoi_feature'])   # (B, Q, D)
+            last_out = out
+
+        # LSTM 时序建模：(T, B*Q, D) → (T, B*Q, hidden)
+        feat_seq  = torch.stack(hoi_features, dim=0)  # (T, B, Q, D)
+        T_, B_, Q, D = feat_seq.shape
+        feat_flat = feat_seq.reshape(T_, B_ * Q, D)
+        lstm_out, _ = self.lstm(feat_flat)
+
+        curr_feat       = lstm_out[-1].reshape(B_, Q, -1)   # (B, Q, hidden)
+        curr_hoi_logits = self.curr_hoi_head(curr_feat)      # (B, Q, N_hoi)
+        future_hoi_logits = [head(curr_feat) for head in self.future_hoi_heads]
+
+        return {
+            'pred_hoi_logits':   curr_hoi_logits,
+            'pred_obj_logits':   last_out['pred_obj_logits'],
+            'pred_sub_boxes':    last_out['pred_sub_boxes'],
+            'pred_obj_boxes':    last_out['pred_obj_boxes'],
+            'future_hoi_logits': future_hoi_logits,
+            'clip_visual':       last_out.get('clip_visual'),
+            'clip_logits':       last_out.get('clip_logits'),
+        }
 
 
 def build(args):
