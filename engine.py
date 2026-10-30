@@ -226,6 +226,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                  subject_category_id, device, args):
     model.eval()
+    if os.environ.get('EVAL_PROFILE', '0') == '1':
+        # Timing / memory numbers are only valid for a bare model on a single GPU.
+        assert not isinstance(model, torch.nn.parallel.DistributedDataParallel), "EVAL_PROFILE=1: model must not be wrapped in DDP"
+        assert utils.get_world_size() == 1, "EVAL_PROFILE=1 requires a single process (NPROC_PER_NODE=1)"
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -237,11 +241,23 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
     use_cuda = torch.device(device).type == 'cuda'
     inf_total_time = 0
     timed_batches = 0
-    warmup_batches = int(os.environ.get('EVAL_WARMUP_BATCHES', '0'))
+    n_clips = 0    # clips in the timed batches (a clip = max_length frames, one entry of `targets`)
+    n_frames = 0   # frames in the timed batches
+    eff = {}   # efficiency numbers, re-printed together at the very end of the log
+    warmup_batches = int(os.environ.get('EVAL_WARMUP_BATCHES', '30'))
     max_batches = getattr(args, 'eval_max_batches', 0)   # 0 = whole split
     if use_cuda:
         # Peak stats start here: model weights already on GPU are still counted.
         torch.cuda.reset_peak_memory_stats(device)
+        # memory held by weights/buffers before any input is seen (diagnoses allocated vs model size)
+        eff['Weights resident (allocated before 1st batch)'] = f"{torch.cuda.memory_allocated(device) / 2**20:.0f} MiB"
+        _dt = {}
+        for _p in model.parameters():
+            _dt[str(_p.dtype)] = _dt.get(str(_p.dtype), 0) + _p.numel()
+        eff['Param dtypes (numel)'] = ", ".join(f"{k.replace('torch.', '')}: {v / 1e6:.1f} M" for k, v in _dt.items())
+        # memory held right now = weights + buffers only; peak minus this = activation/workspace part
+        weights_mem_mib = torch.cuda.memory_allocated(device) / 2**20
+        eff['Weights memory'] = f"{weights_mem_mib:.0f} MiB (resident before the first batch)"
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -253,32 +269,45 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
             n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"Params: total {n_total / 1e6:.2f} M, trainable {n_train / 1e6:.2f} M "
                   f"(frozen HOICLIP is included in total)")
+            eff['Params'] = f"total {n_total / 1e6:.2f} M, trainable {n_train / 1e6:.2f} M"
             # FlopCounterMode only counts aten matmul/conv/sdpa-style ops (2*MACs); custom
             # CUDA ops (e.g. deformable attention) and cuDNN LSTM are not counted -> lower bound.
             from torch.utils.flop_counter import FlopCounterMode
             # enable_grad: the module tracker asserts on grad-less parameters under no_grad.
             with torch.enable_grad(), FlopCounterMode(display=False) as flop_counter:
                 model(samples, is_training=False, clip_input=clip_img, targets=targets)
-            print(f"GFLOPs (aten ops only, per batch of {args.batch_size}; frames in batch: "
-                  f"{samples.tensors.shape[0]}): {flop_counter.get_total_flops() / 1e9:.2f}")
+            print(f"GFLOPs per clip (aten ops only; {samples.tensors.shape[0]} frames in {len(targets)} clip(s)): "
+                  f"{flop_counter.get_total_flops() / 1e9 / len(targets):.2f}")
+            eff['Input tensor (first batch)'] = str(tuple(samples.tensors.shape)) + f", clip_input {tuple(clip_img.shape)}"
+            eff['GFLOPs per clip (aten only, lower bound)'] = f"{flop_counter.get_total_flops() / 1e9 / len(targets):.2f}"
             if use_cuda:
-                # the profiling pass must not leak into the reported peak memory
+                # the profiling pass must not leak into the reported peak memory; it ran with grad
+                # enabled (activations kept), and reset_peak_memory_stats does not release the
+                # cached blocks, so free them or "reserved" keeps that pass's footprint.
+                torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(device)
 
         if use_cuda:
             # CUDA is async: finish the H2D copies so they are not billed to the model.
             torch.cuda.synchronize(device)
-        start_time = time.time()
-        outputs = model(samples, is_training=False, clip_input=clip_img, targets=targets)
-        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-        results = postprocessors['hoi'](outputs, orig_target_sizes)
+        start_time = time.perf_counter()
+        # inference_mode only around the forward: the FLOPs profiling above needs autograd bookkeeping,
+        # and inputs were created outside it so they are ordinary tensors.
+        with torch.inference_mode():
+            outputs = model(samples, is_training=False, clip_input=clip_img, targets=targets)
+            orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+            results = postprocessors['hoi'](outputs, orig_target_sizes)
         if use_cuda:
-            # wait for queued kernels, otherwise time.time() only measures launch
+            # wait for queued kernels, otherwise perf_counter only measures launch
             torch.cuda.synchronize(device)
         if counter >= warmup_batches:
             # first batches pay CUDA init / cuDNN autotune / allocator warm-up: run them untimed
-            inf_total_time += time.time() - start_time
+            inf_total_time += time.perf_counter() - start_time
             timed_batches += 1
+            n_clips += len(targets)
+            n_frames += samples.tensors.shape[0]   # (batch*max_length, 3, H, W): one entry per frame
+        # results came from inference_mode: clone into ordinary tensors for the evaluators
+        results = [{k: (v.clone() if torch.is_tensor(v) else v) for k, v in r.items()} for r in results]
 
         results, eval_targets = _prepare_hoi_eval_batch(
             results, targets,
@@ -297,11 +326,20 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         # allocated = tensors in use at peak; reserved = caching-allocator pool (closer to nvidia-smi).
         print(f"Peak GPU memory: allocated {torch.cuda.max_memory_allocated(device) / 2**20:.0f} MiB, "
               f"reserved {torch.cuda.max_memory_reserved(device) / 2**20:.0f} MiB")
+        eff['Activation peak (alloc - weights)'] = f"{torch.cuda.max_memory_allocated(device) / 2**20 - weights_mem_mib:.0f} MiB"
+        eff['Peak GPU memory'] = (f"allocated {torch.cuda.max_memory_allocated(device) / 2**20:.0f} MiB, "
+                                  f"reserved {torch.cuda.max_memory_reserved(device) / 2**20:.0f} MiB")
     if timed_batches > 0:
-        # Per batch; with batch_size == 1 this is per sample (one clip of max_length frames).
-        print(f"Avg inference time: {inf_total_time / timed_batches * 1000:.2f} ms/batch, "
-              f"FPS: {timed_batches / inf_total_time:.2f} batches/s over {timed_batches} timed batches "
-              f"({warmup_batches} warm-up batches excluded; per-sample only when batch_size == 1)")
+        # latency is per clip (max_length frames per forward); FPS counts frames
+        print(f"Timed {n_clips} clips / {n_frames} frames ({warmup_batches} warm-up batches excluded, "
+              f"batch_size={args.batch_size})")
+        print(f"Avg latency: {inf_total_time / n_clips * 1000:.2f} ms/clip")
+        print(f"FPS (frames): {n_frames / inf_total_time:.2f}")
+        eff['Avg latency'] = f"{inf_total_time / n_clips * 1000:.2f} ms/clip"
+        eff['FPS (frames)'] = f"{n_frames / inf_total_time:.2f}"
+        eff['Timed'] = f"{n_clips} clips / {n_frames} frames (batch_size={args.batch_size}, {warmup_batches} warm-up batches excluded)"
+    else:
+        print(f"WARNING: fewer than {warmup_batches + 1} batches, nothing was timed")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -457,6 +495,12 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Total time computing mAP: {}'.format(total_time_str))
 
+    if eff:
+        # printed last so the numbers are not buried in the progress/mAP output above
+        print("\n========== Efficiency summary ==========")
+        for k, v in eff.items():
+            print(f"{k}: {v}")
+        print("========================================")
     return utils.broadcast_object(stats)
 
 

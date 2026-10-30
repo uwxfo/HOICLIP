@@ -7,8 +7,8 @@
 #   CHECKPOINT=/path/to/checkpoint.pth MONITOR_GPU=1 bash eval_lstm_vidhoi.sh
 #
 # engine.py::evaluate_hoi (EVAL_PROFILE=1) prints params, GFLOPs, "Peak GPU memory"
-# (allocated/reserved) and avg inference time / FPS. BATCH_SIZE defaults to 1 so the
-# time is per sample (one clip of max_length frames).
+# (allocated/reserved) and avg latency (ms/clip) and FPS (frames) after 30 warm-up batches.
+# BATCH_SIZE defaults to 1 (one clip of max_length frames per forward).
 
 set -euo pipefail
 
@@ -40,6 +40,7 @@ if [ "${RANDOM_INIT}" != "1" ] && [ ! -f "${CHECKPOINT}" ]; then
 fi
 
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+if [ "${EVAL_PROFILE:-1}" = "1" ] && [ "${NPROC_PER_NODE}" != "1" ]; then echo "EVAL_PROFILE=1 needs NPROC_PER_NODE=1"; exit 1; fi
 export MASTER_PORT="${MASTER_PORT:-29603}"
 export BATCH_SIZE="${BATCH_SIZE:-1}"
 # The checkpoint comes in via RESUME; an empty PRETRAINED keeps train script from also passing --pretrained.
@@ -48,7 +49,7 @@ export RESUME="${CHECKPOINT}"
 if [ "${RANDOM_INIT}" = "1" ]; then
     export RESUME=""
     # first batches are CUDA/cuDNN warm-up and are excluded from the timing
-    export EVAL_WARMUP_BATCHES="${EVAL_WARMUP_BATCHES:-10}"
+    export EVAL_WARMUP_BATCHES="${EVAL_WARMUP_BATCHES:-30}"
     set -- --eval_max_batches "${EVAL_MAX_BATCHES:-300}" "$@"
 fi
 export EVAL_PROFILE="${EVAL_PROFILE:-1}"

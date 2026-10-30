@@ -41,7 +41,7 @@ MAX_LENGTH="${MAX_LENGTH:-6}"
 MIN_FUTURE="${MIN_FUTURE:-3}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-VAL_RATIO="${VAL_RATIO:-1.0}"
+VAL_RATIO="${VAL_RATIO:-0.4}"
 
 if [ -z "${RESUME}" ]; then
     echo "Set RESUME=/path/to/checkpoint.pth"

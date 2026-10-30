@@ -99,6 +99,7 @@ python -m torch.distributed.run \
     --verb_pth ./tmp/verb.pth \
     --training_free_enhancement_path "" \
     --train_ratio "${TRAIN_RATIO}" \
+    --val_ratio "${VAL_RATIO:-0.4}" \
     --max_length 6 \
     --min_length 6 \
     --min_future 3 \

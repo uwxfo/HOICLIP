@@ -141,8 +141,8 @@ def get_args_parser():
     parser.add_argument('--hoi_path', type=str)
     parser.add_argument('--train_ratio', default=1.0, type=float,
                         help='Fraction of training annotations to use (VidHOI)')
-    parser.add_argument('--val_ratio', default=1.0, type=float,
-                        help='Fraction of validation annotations to use (VidHOI, unused)')
+    parser.add_argument('--val_ratio', default=0.4, type=float,
+                        help='Fraction of validation annotations to use (VidHOI)')
 
     # HOICLIP_LSTM clip-mode arguments
     parser.add_argument('--max_length', default=6,   type=int,
@@ -347,7 +347,9 @@ def main(args):
     print('****************')
 
     model_without_ddp = model
-    if args.distributed:
+    # DDP is only needed for training; in --eval it would add gradient buckets (inflating the measured
+    # peak memory) and an extra wrapper. Eval needs no gradient sync; utils.all_gather still works.
+    if args.distributed and not args.eval:
         if args.enable_amp:
             raise NotImplementedError
         else:

@@ -99,5 +99,6 @@ python -m torch.distributed.run \
     --verb_pth ./tmp/verb.pth \
     ${ENHANCEMENT_PATH:+--training_free_enhancement_path "${ENHANCEMENT_PATH}"} \
     --train_ratio "${TRAIN_RATIO}" \
+    --val_ratio "${VAL_RATIO:-0.4}" \
     ${RESUME:+--resume "${RESUME}"} \
     "$@"
