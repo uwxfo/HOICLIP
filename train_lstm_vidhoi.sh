@@ -20,6 +20,8 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 DATA_ROOT="${DATA_ROOT:-../VidHOI}"
 PRETRAINED="${PRETRAINED:-output/hoiclip/hoiclip_05301154/checkpoint_best.pth}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./output}"
+# `${PRETRAINED:-default}` also replaces an empty value, so RANDOM_INIT must clear it explicitly.
+[ "${RANDOM_INIT:-0}" = "1" ] && PRETRAINED=""
 EPOCHS="${EPOCHS:-50}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 LR_DROP="${LR_DROP:-30}"
@@ -61,7 +63,8 @@ if [ -n "${RESUME}" ] && [ ! -f "${RESUME}" ]; then
     exit 1
 fi
 
-if [ -z "${RESUME}" ] && [ ! -f "${PRETRAINED}" ]; then
+# RANDOM_INIT=1: efficiency-only eval with randomly initialised weights, no checkpoint needed.
+if [ "${RANDOM_INIT:-0}" != "1" ] && [ -z "${RESUME}" ] && [ ! -f "${PRETRAINED}" ]; then
     echo "Missing pretrained checkpoint: ${PRETRAINED}"
     exit 1
 fi

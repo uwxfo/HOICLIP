@@ -236,6 +236,9 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
 
     use_cuda = torch.device(device).type == 'cuda'
     inf_total_time = 0
+    timed_batches = 0
+    warmup_batches = int(os.environ.get('EVAL_WARMUP_BATCHES', '0'))
+    max_batches = getattr(args, 'eval_max_batches', 0)   # 0 = whole split
     if use_cuda:
         # Peak stats start here: model weights already on GPU are still counted.
         torch.cuda.reset_peak_memory_stats(device)
@@ -272,7 +275,10 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         if use_cuda:
             # wait for queued kernels, otherwise time.time() only measures launch
             torch.cuda.synchronize(device)
-        inf_total_time += time.time() - start_time
+        if counter >= warmup_batches:
+            # first batches pay CUDA init / cuDNN autotune / allocator warm-up: run them untimed
+            inf_total_time += time.time() - start_time
+            timed_batches += 1
 
         results, eval_targets = _prepare_hoi_eval_batch(
             results, targets,
@@ -283,16 +289,19 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
         counter += 1
         if counter >= 20 and args.no_training:
             break
+        if max_batches > 0 and counter >= max_batches:
+            # efficiency-only runs (e.g. random weights, where mAP is meaningless)
+            break
 
     if use_cuda:
         # allocated = tensors in use at peak; reserved = caching-allocator pool (closer to nvidia-smi).
         print(f"Peak GPU memory: allocated {torch.cuda.max_memory_allocated(device) / 2**20:.0f} MiB, "
               f"reserved {torch.cuda.max_memory_reserved(device) / 2**20:.0f} MiB")
-    if counter > 0:
+    if timed_batches > 0:
         # Per batch; with batch_size == 1 this is per sample (one clip of max_length frames).
-        print(f"Avg inference time: {inf_total_time / counter * 1000:.2f} ms/batch, "
-              f"FPS: {counter / inf_total_time:.2f} batches/s over {counter} batches "
-              f"(per-sample only when batch_size == 1)")
+        print(f"Avg inference time: {inf_total_time / timed_batches * 1000:.2f} ms/batch, "
+              f"FPS: {timed_batches / inf_total_time:.2f} batches/s over {timed_batches} timed batches "
+              f"({warmup_batches} warm-up batches excluded; per-sample only when batch_size == 1)")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

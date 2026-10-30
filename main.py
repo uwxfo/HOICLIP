@@ -190,6 +190,8 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--eval_max_batches', type=int, default=0,
+                        help='Eval only: stop after this many batches (0 = whole split). For efficiency-only runs.')
     parser.add_argument('--num_workers', default=2, type=int)
 
     # distributed training parameters
