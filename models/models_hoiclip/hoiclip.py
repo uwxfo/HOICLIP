@@ -29,7 +29,7 @@ from datasets.vidhoi_text_label import vidhoi_text_label, vidhoi_obj_text_label
 from datasets.ag_text_label import ag_text_label, ag_obj_text_label
 
 from ..backbone import build_backbone
-from ..matcher import build_matcher
+from ..matcher import build_matcher, build_temporal_frame_weights
 from .gen import build_gen
 
 
@@ -37,6 +37,19 @@ def _sigmoid(x):
     # 带截断的 sigmoid，避免极端值导致 log/梯度数值不稳定（常用于 focal loss 变体）。
     y = torch.clamp(x.sigmoid(), min=1e-4, max=1 - 1e-4)
     return y
+
+
+def _build_future_hoi_weight_dict(args):
+    total = float(args.anticipation_hoi_coef)
+    gamma = float(args.anticipation_horizon_gamma)
+    if total < 0 or gamma < 0:
+        raise ValueError('anticipation loss coefficients must be non-negative')
+    raw = [gamma ** index for index in range(4)]
+    normalizer = sum(raw) or 1.0
+    return {
+        f'loss_hoi_labels_f{horizon}': total * weight / normalizer
+        for horizon, weight in zip([1, 3, 5, 7], raw)
+    }
 
 
 class HOICLIP(nn.Module):
@@ -391,6 +404,17 @@ class SetCriterionHOI(nn.Module):
         else:
             self.clip_model = None
         self.alpha = args.alpha
+        self.is_lstm = getattr(args, 'model_name', None) == 'HOICLIP_LSTM'
+        self.clip_num_frames = getattr(args, 'max_length', 1) if self.is_lstm else 1
+        self.future_horizons = [1, 3, 5, 7]
+        self.register_buffer(
+            'detection_frame_weights',
+            build_temporal_frame_weights(
+                self.clip_num_frames,
+                getattr(args, 'detection_frame_weighting', 'uniform'),
+                getattr(args, 'detection_frame_weight_power', 1.0),
+            ),
+        )
 
     def loss_obj_labels(self, outputs, targets, indices, num_interactions, log=True):
         assert 'pred_obj_logits' in outputs
@@ -433,7 +457,8 @@ class SetCriterionHOI(nn.Module):
         losses = {'loss_verb_ce': loss_verb_ce}
         return losses
 
-    def loss_hoi_labels(self, outputs, targets, indices, num_interactions, topk=5):
+    def loss_hoi_labels(self, outputs, targets, indices, num_interactions,
+                        topk=5, indices_future=None):
         assert 'pred_hoi_logits' in outputs
         src_logits = outputs['pred_hoi_logits']
         dtype = src_logits.dtype
@@ -444,10 +469,61 @@ class SetCriterionHOI(nn.Module):
         target_classes[idx] = target_classes_o
         src_logits = _sigmoid(src_logits)
         # HOI 分类使用 focal-like 的负样本挖掘损失（`_neg_loss`）。
-        loss_hoi_ce = self._neg_loss(src_logits, target_classes, weights=None, alpha=self.alpha)
+        if self.is_lstm:
+            batch_size, total_queries, num_classes = src_logits.shape
+            queries_per_frame = total_queries // self.clip_num_frames
+            src_by_frame = src_logits.view(
+                batch_size, self.clip_num_frames, queries_per_frame, num_classes
+            )
+            target_by_frame = target_classes.view_as(src_by_frame)
+            frame_weights = self.detection_frame_weights.to(src_logits.device, src_logits.dtype)
+            loss_hoi_ce = sum(
+                frame_weights[frame_index]
+                * self._neg_loss(
+                    src_by_frame[:, frame_index],
+                    target_by_frame[:, frame_index],
+                    weights=None,
+                    alpha=self.alpha,
+                )
+                for frame_index in range(self.clip_num_frames)
+            )
+        else:
+            loss_hoi_ce = self._neg_loss(src_logits, target_classes, weights=None, alpha=self.alpha)
         losses = {'loss_hoi_labels': loss_hoi_ce}
 
-        _, pred = src_logits[idx].topk(topk, 1, True, True)
+        future_logits = outputs.get('future_hoi_logits')
+        if future_logits is not None:
+            if indices_future is None:
+                raise ValueError('future_hoi_logits requires future matching indices')
+            future_flat = torch.cat(future_logits, dim=1)
+            future_targets = torch.zeros_like(future_flat)
+            future_idx = self._get_src_permutation_idx(indices_future)
+            matched_future = [
+                target['hoi_labels_future'][target_indices]
+                for target, (_, target_indices) in zip(targets, indices_future)
+                if 'hoi_labels_future' in target and target_indices.numel() > 0
+            ]
+            if matched_future:
+                future_targets[future_idx] = torch.cat(matched_future).to(future_flat.dtype)
+            future_targets = future_targets.chunk(len(self.future_horizons), dim=1)
+            for slot, (horizon, logits_h, targets_h) in enumerate(zip(
+                self.future_horizons, future_logits, future_targets
+            )):
+                keep = torch.tensor(
+                    [horizon in target.get('future', []) for target in targets],
+                    device=logits_h.device,
+                    dtype=torch.bool,
+                )
+                if keep.any():
+                    losses[f'loss_hoi_labels_f{horizon}'] = self._neg_loss(
+                        _sigmoid(logits_h[keep]), targets_h[keep],
+                        weights=None, alpha=self.alpha,
+                    )
+                else:
+                    # Keep every future head in the graph for short clips and DDP.
+                    losses[f'loss_hoi_labels_f{horizon}'] = logits_h.sum() * 0.0
+
+        _, pred = src_logits[idx].topk(min(topk, src_logits.shape[-1]), 1, True, True)
         acc = 0.0
         for tid, target in enumerate(target_classes_o):
             tgt_idx = torch.where(target == 1)[0]
@@ -565,7 +641,11 @@ class SetCriterionHOI(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        if 'future_hoi_logits' in outputs_without_aux:
+            indices, indices_future = self.matcher(outputs_without_aux, targets)
+        else:
+            indices = self.matcher(outputs_without_aux, targets)
+            indices_future = None
 
         num_interactions = sum(len(t['hoi_labels']) for t in targets)
         num_interactions = torch.as_tensor([num_interactions], dtype=torch.float,
@@ -577,7 +657,11 @@ class SetCriterionHOI(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_interactions))
+            kwargs = {'indices_future': indices_future} if loss == 'hoi_labels' else {}
+            losses.update(self.get_loss(
+                loss, outputs, targets, indices, num_interactions,
+                **kwargs,
+            ))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -608,6 +692,8 @@ class PostProcessHOITriplet(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.subject_category_id = args.subject_category_id
+        self.num_frames = getattr(args, 'max_length', 1)
+        self.is_lstm = getattr(args, 'model_name', None) == 'HOICLIP_LSTM'
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -617,6 +703,20 @@ class PostProcessHOITriplet(nn.Module):
         out_obj_boxes = outputs['pred_obj_boxes']
         clip_visual = outputs['clip_visual']
         clip_logits = outputs['clip_logits']
+        future_hoi_logits = outputs.get('future_hoi_logits')
+
+        if self.is_lstm:
+            if out_hoi_logits.shape[1] % self.num_frames != 0:
+                raise ValueError(
+                    f"LSTM query count {out_hoi_logits.shape[1]} is not divisible by "
+                    f"T={self.num_frames}"
+                )
+            queries_per_frame = out_hoi_logits.shape[1] // self.num_frames
+            current = slice((self.num_frames - 1) * queries_per_frame, None)
+            out_hoi_logits = out_hoi_logits[:, current]
+            out_obj_logits = out_obj_logits[:, current]
+            out_sub_boxes = out_sub_boxes[:, current]
+            out_obj_boxes = out_obj_boxes[:, current]
 
         assert len(out_hoi_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -645,6 +745,10 @@ class PostProcessHOITriplet(nn.Module):
 
             results[-1].update({'hoi_scores': hs.to('cpu'), 'obj_scores': os.to('cpu'), 'clip_visual': clip_visual[index].to('cpu'),
                                 'sub_ids': ids[:ids.shape[0] // 2], 'obj_ids': ids[ids.shape[0] // 2:], 'clip_logits': clip_logits[index].to('cpu')})
+            if future_hoi_logits is not None:
+                results[-1]['hoi_scores_future'] = torch.cat([
+                    _sigmoid(logits[index]).to('cpu') for logits in future_hoi_logits
+                ], dim=0)
 
         return results
 
@@ -678,6 +782,8 @@ class HOICLIP_LSTM(nn.Module):
 
     def __init__(self, hoiclip: HOICLIP, args):
         super().__init__()
+        # Version 2 is the first layout with sample-major BxT restoration and future losses.
+        self.register_buffer('_temporal_layout_version', torch.tensor(2), persistent=True)
         # 冻结 HOICLIP 全部参数
         self.hoiclip = hoiclip
         for p in self.hoiclip.parameters():
@@ -730,29 +836,39 @@ class HOICLIP_LSTM(nn.Module):
 
         T    = self.T
         B_T  = samples.tensors.shape[0]
+        if B_T % T != 0:
+            raise ValueError(f"Flattened clip batch {B_T} is not divisible by T={T}")
         B    = B_T // T
 
-        # 按帧拆分 NestedTensor：(B*T, ...) → T × (B, ...)
-        tensors_t = samples.tensors.chunk(T, dim=0)   # T × (B, 3, H, W)
-        masks_t   = samples.mask.chunk(T, dim=0)      # T × (B, H, W)
+        # collate 按样本优先展平；先恢复 (B,T,...) 才能按时间取帧，避免 B>1 时混样本。
+        tensors_bt = samples.tensors.reshape(B, T, *samples.tensors.shape[1:])
+        masks_bt = samples.mask.reshape(B, T, *samples.mask.shape[1:])
 
         # 拆分 clip_input
         if clip_input is not None:
             if clip_input.dim() == 5:                  # (B, T, 3, 224, 224)
-                clip_flat = clip_input.reshape(B * T, *clip_input.shape[2:])
+                if clip_input.shape[:2] != (B, T):
+                    raise ValueError(
+                        f"clip_input batch/time {tuple(clip_input.shape[:2])} != {(B, T)}"
+                    )
+                clip_bt = clip_input
             else:                                      # (B*T, 3, 224, 224)
-                clip_flat = clip_input
-            clip_t = clip_flat.chunk(T, dim=0)
+                if clip_input.shape[0] != B_T:
+                    raise ValueError(
+                        f"Flattened clip_input batch {clip_input.shape[0]} != image batch {B_T}"
+                    )
+                clip_bt = clip_input.reshape(B, T, *clip_input.shape[1:])
         else:
-            clip_t = [None] * T
+            clip_bt = None
 
         # 逐帧过冻结 HOICLIP，提取 hoi_feature
         hoi_features = []
         last_out = None
         for t in range(T):
-            nt = NestedTensor(tensors_t[t], masks_t[t])
+            nt = NestedTensor(tensors_bt[:, t], masks_bt[:, t])
+            clip_frame = clip_bt[:, t] if clip_bt is not None else None
             with torch.no_grad():
-                out = self.hoiclip(nt, is_training=is_training, clip_input=clip_t[t])
+                out = self.hoiclip(nt, is_training=is_training, clip_input=clip_frame)
             hoi_features.append(out['hoi_feature'])   # (B, Q, D)
             last_out = out
 
@@ -766,11 +882,17 @@ class HOICLIP_LSTM(nn.Module):
         curr_hoi_logits = self.curr_hoi_head(curr_feat)      # (B, Q, N_hoi)
         future_hoi_logits = [head(curr_feat) for head in self.future_hoi_heads]
 
+        # Clip matcher supervises one stable query/pair assignment on every observed frame.
+        # Spatial predictions stay frozen, so the last-frame tensors are repeated only to
+        # align their query layout with the flattened (T*num_pairs) training targets.
+        def _repeat_observed(tensor):
+            return tensor.unsqueeze(1).expand(-1, T, -1, -1).flatten(1, 2)
+
         return {
-            'pred_hoi_logits':   curr_hoi_logits,
-            'pred_obj_logits':   last_out['pred_obj_logits'],
-            'pred_sub_boxes':    last_out['pred_sub_boxes'],
-            'pred_obj_boxes':    last_out['pred_obj_boxes'],
+            'pred_hoi_logits':   _repeat_observed(curr_hoi_logits),
+            'pred_obj_logits':   _repeat_observed(last_out['pred_obj_logits']),
+            'pred_sub_boxes':    _repeat_observed(last_out['pred_sub_boxes']),
+            'pred_obj_boxes':    _repeat_observed(last_out['pred_obj_boxes']),
             'future_hoi_logits': future_hoi_logits,
             'clip_visual':       last_out.get('clip_visual'),
             'clip_logits':       last_out.get('clip_logits'),
@@ -795,34 +917,32 @@ def build(args):
 
     matcher = build_matcher(args)
     weight_dict = {}
-    if args.with_clip_label:
+    if args.model_name == 'HOICLIP_LSTM':
+        # Frozen HOICLIP spatial outputs are used for matching, not optimization.
         weight_dict['loss_hoi_labels'] = args.hoi_loss_coef
-        weight_dict['loss_obj_ce'] = args.obj_loss_coef
+        weight_dict.update(_build_future_hoi_weight_dict(args))
+        losses = ['hoi_labels']
     else:
         weight_dict['loss_hoi_labels'] = args.hoi_loss_coef
         weight_dict['loss_obj_ce'] = args.obj_loss_coef
-
-    weight_dict['loss_sub_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_obj_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_sub_giou'] = args.giou_loss_coef
-    weight_dict['loss_obj_giou'] = args.giou_loss_coef
-    if args.with_mimic:
-        weight_dict['loss_feat_mimic'] = args.mimic_loss_coef
-
-    if args.with_rec_loss:
-        weight_dict['loss_rec'] = args.rec_loss_coef
-
-    if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
-    losses = ['hoi_labels', 'obj_labels', 'sub_obj_boxes']
-    if args.with_mimic:
-        losses.append('feats_mimic')
-
-    if args.with_rec_loss:
-        losses.append('rec_loss')
+        weight_dict['loss_sub_bbox'] = args.bbox_loss_coef
+        weight_dict['loss_obj_bbox'] = args.bbox_loss_coef
+        weight_dict['loss_sub_giou'] = args.giou_loss_coef
+        weight_dict['loss_obj_giou'] = args.giou_loss_coef
+        if args.with_mimic:
+            weight_dict['loss_feat_mimic'] = args.mimic_loss_coef
+        if args.with_rec_loss:
+            weight_dict['loss_rec'] = args.rec_loss_coef
+        if args.aux_loss:
+            aux_weight_dict = {}
+            for i in range(args.dec_layers - 1):
+                aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+            weight_dict.update(aux_weight_dict)
+        losses = ['hoi_labels', 'obj_labels', 'sub_obj_boxes']
+        if args.with_mimic:
+            losses.append('feats_mimic')
+        if args.with_rec_loss:
+            losses.append('rec_loss')
 
     criterion = SetCriterionHOI(args.num_obj_classes, args.num_queries, args.num_verb_classes, matcher=matcher,
                                 weight_dict=weight_dict, eos_coef=args.eos_coef, losses=losses,

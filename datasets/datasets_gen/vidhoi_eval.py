@@ -39,6 +39,7 @@ class VidHOIEvaluator:
         nms_alpha=1.0,
         nms_beta=0.0,
         output_dir="",
+        suffix="",
     ):
         self.overlap_iou = 0.5
         self.max_hois = 100
@@ -46,6 +47,7 @@ class VidHOIEvaluator:
         self.human_top_ks = [10, 20, 50, 100]
         self.human_score_threshold = 0.0
         self.output_dir = Path(output_dir) if output_dir else None
+        self.suffix = suffix
 
         self.use_nms_filter = use_nms_filter
         self.thres_nms = thres_nms
@@ -373,9 +375,9 @@ class VidHOIEvaluator:
             if self.output_dir is not None:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 ap_files = {
-                    "ap_list.json": ap,
-                    "rare_ap_list.json": rare_ap,
-                    "non_rare_ap_list.json": non_rare_ap,
+                    f"ap_list{self.suffix}.json": ap,
+                    f"rare_ap_list{self.suffix}.json": rare_ap,
+                    f"non_rare_ap_list{self.suffix}.json": non_rare_ap,
                 }
                 for filename, values in ap_files.items():
                     with (self.output_dir / filename).open("w") as f:

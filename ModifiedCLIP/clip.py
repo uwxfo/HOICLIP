@@ -40,8 +40,15 @@ _MODELS = {
 }
 
 
-def _download(url: str, root: str):
+def _ensure_cache_directory(root: str):
+    # A cache symlink may dangle after its /tmp target is cleaned between runs.
+    if os.path.islink(root):
+        os.makedirs(os.path.realpath(root), exist_ok=True)
     os.makedirs(root, exist_ok=True)
+
+
+def _download(url: str, root: str):
+    _ensure_cache_directory(root)
     filename = os.path.basename(url)
 
     expected_sha256 = url.split("/")[-2]

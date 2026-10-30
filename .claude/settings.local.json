@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"\")",
+      "Bash(echo \"alias cc='claude --dangerously-skip-permissions'\")",
+      "Read(//home/yluo/**)",
+      "Bash(cs config *)",
+      "Bash(cs --help)",
+      "Bash(cs --detail)",
+      "Bash(pactl info *)",
+      "Bash(xset q *)",
+      "Read(//dev/pts/**)",
+      "Bash(who)",
+      "Bash(chmod +x *)",
+      "Bash(cs render *)",
+      "Bash(/home/yluo/miniconda3/bin/cs render *)",
+      "Bash(tmux show-options *)"
+    ]
+  }
+}

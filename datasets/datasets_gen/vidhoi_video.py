@@ -529,11 +529,10 @@ class VidHOI_Clip(VidHOI):
                         
                             }
                         )
-                if hois_future:
-                    anticipations["future"].append(future)
-                    anticipations["hois_future"].append(hois_future)
-                    #anticipations["boxes_future"]=torch.cat([targets["boxes"][-1], *boxes_future], dim=0)
-                    #anticipations["labels_future"]=torch.cat([targets["labels"][-1], *labels_future], dim=0)
+                # Keep empty-GT horizons too; otherwise false positives on those frames
+                # disappear from evaluation and future metrics become optimistically biased.
+                anticipations["future"].append(future)
+                anticipations["hois_future"].append(hois_future)
 
             if anticipations["future"]:
                 targets.update(anticipations)

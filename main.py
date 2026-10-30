@@ -29,6 +29,19 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
+def validate_lstm_checkpoint_layout(checkpoint_model, checkpoint_path):
+    is_lstm = any(
+        key.startswith(('lstm.', 'curr_hoi_head.', 'future_hoi_heads.'))
+        for key in checkpoint_model
+    )
+    if is_lstm and '_temporal_layout_version' not in checkpoint_model:
+        raise RuntimeError(
+            f'{checkpoint_path} is an old HOICLIP_LSTM checkpoint trained with the '
+            'incorrect temporal layout. Restart with --pretrained pointing to a plain '
+            'HOICLIP checkpoint instead of resuming it.'
+        )
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -152,6 +165,19 @@ def get_args_parser():
     parser.add_argument('--freeze_temporal', action='store_true',
                         help='HOICLIP_LSTM cross-dataset linear probe: additionally freeze the '
                              'LSTM, leaving only curr_hoi_head and future_hoi_heads trainable.')
+    parser.add_argument('--anticipation_hoi_coef', default=0.8, type=float,
+                        help='Total loss coefficient distributed over future horizons.')
+    parser.add_argument('--anticipation_horizon_gamma', default=0.7, type=float,
+                        help='Geometric decay for future horizons [1,3,5,7].')
+    parser.add_argument('--anticipation_ramp_epochs', default=8, type=int,
+                        help='Epochs used to ramp future HOI loss weights to full strength.')
+    parser.add_argument('--anticipation_ramp_start_factor', default=0.25, type=float,
+                        help='Future-loss multiplier at epoch zero.')
+    parser.add_argument('--detection_frame_weighting', default='linear',
+                        choices=['uniform', 'linear'],
+                        help='Observed-frame weighting for clip matching and current HOI loss.')
+    parser.add_argument('--detection_frame_weight_power', default=1.0, type=float,
+                        help='Exponent applied to linear observed-frame weights.')
 
     parser.add_argument('--output_dir', default='',
                         help='base directory for output; a timestamped subdirectory is created inside')
@@ -248,6 +274,8 @@ def main(args):
 
     args.save_points = []  # populated via --save_points if the arg is ever added back
     args.anticipation=True
+    if args.resume and not args.resume.startswith('https') and not os.path.exists(args.resume):
+        raise FileNotFoundError(f'Resume checkpoint does not exist: {args.resume}')
     print('setting up seeds')
     setup_seed(233)
 
@@ -503,6 +531,8 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         ckpt_model = checkpoint['model']
+        if args.model_name == 'HOICLIP_LSTM':
+            validate_lstm_checkpoint_layout(ckpt_model, args.resume)
         current_keys = set(model_without_ddp.state_dict().keys())
         ckpt_keys = set(ckpt_model.keys())
         # If there is no key overlap, try prefixing with 'hoiclip.' to handle
@@ -529,6 +559,8 @@ def main(args):
     elif args.pretrained:
         checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
         ckpt_model = checkpoint['model']
+        if args.model_name == 'HOICLIP_LSTM':
+            validate_lstm_checkpoint_layout(ckpt_model, args.pretrained)
         model_sd = model_without_ddp.state_dict()
         # A plain HOICLIP checkpoint loaded into HOICLIP_LSTM needs the 'hoiclip.' prefix,
         # since the LSTM model wraps HOICLIP as self.hoiclip. A *_LSTM checkpoint already
@@ -613,13 +645,31 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
+    future_weight_keys = [f'loss_hoi_labels_f{h}' for h in (1, 3, 5, 7)]
+    base_future_weights = {
+        key: criterion.weight_dict[key]
+        for key in future_weight_keys if key in criterion.weight_dict
+    }
     for epoch in range(args.start_epoch, args.epochs):
+        ramp_start = float(args.anticipation_ramp_start_factor)
+        if not 0.0 <= ramp_start <= 1.0:
+            raise ValueError('anticipation_ramp_start_factor must be in [0, 1]')
+        if args.anticipation_ramp_epochs <= 1:
+            anticipation_scale = 1.0
+        else:
+            progress = min(max(epoch, 0) / float(args.anticipation_ramp_epochs - 1), 1.0)
+            anticipation_scale = ramp_start + (1.0 - ramp_start) * progress
+        for key, base_weight in base_future_weights.items():
+            criterion.weight_dict[key] = base_weight * anticipation_scale
+
         if args.distributed:
             sampler_train.set_epoch(epoch)
 
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, lr_scheduler,
             args.gradient_accumulation_steps, args.enable_amp, args.no_training, args)
+        if base_future_weights:
+            train_stats['anticipation_loss_scale'] = anticipation_scale
 
         lr_scheduler.step()
         test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val,

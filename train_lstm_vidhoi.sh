@@ -21,11 +21,17 @@ DATA_ROOT="${DATA_ROOT:-../VidHOI}"
 PRETRAINED="${PRETRAINED:-output/hoiclip/hoiclip_05301154/checkpoint_best.pth}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./output}"
 EPOCHS="${EPOCHS:-50}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 LR_DROP="${LR_DROP:-30}"
 BACKBONE="${BACKBONE:-resnet50}"
-RESUME="${RESUME:-output/hoiclip/hoiclip_06050358/checkpoint_last.pth}"
+RESUME="${RESUME:-}"
 TRAIN_RATIO="${TRAIN_RATIO:-1.0}"
+ANTICIPATION_HOI_COEF="${ANTICIPATION_HOI_COEF:-0.8}"
+ANTICIPATION_HORIZON_GAMMA="${ANTICIPATION_HORIZON_GAMMA:-0.7}"
+ANTICIPATION_RAMP_EPOCHS="${ANTICIPATION_RAMP_EPOCHS:-8}"
+ANTICIPATION_RAMP_START_FACTOR="${ANTICIPATION_RAMP_START_FACTOR:-0.25}"
+DETECTION_FRAME_WEIGHTING="${DETECTION_FRAME_WEIGHTING:-linear}"
+DETECTION_FRAME_WEIGHT_POWER="${DETECTION_FRAME_WEIGHT_POWER:-1.0}"
 
 # Run name for organising output directories — mirrors RLIPVISTR's --name convention.
 NAME="${NAME:-hoiclip}"
@@ -47,6 +53,16 @@ fi
 
 if [ ! -f "${DATA_ROOT}/VidHOI_annotation/train_frame_hoia.json" ]; then
     echo "Missing ${DATA_ROOT}/VidHOI_annotation/train_frame_hoia.json"
+    exit 1
+fi
+
+if [ -n "${RESUME}" ] && [ ! -f "${RESUME}" ]; then
+    echo "Missing resume checkpoint: ${RESUME}"
+    exit 1
+fi
+
+if [ -z "${RESUME}" ] && [ ! -f "${PRETRAINED}" ]; then
+    echo "Missing pretrained checkpoint: ${PRETRAINED}"
     exit 1
 fi
 
@@ -86,5 +102,11 @@ python -m torch.distributed.run \
     --sample_mode window \
     --lstm_hidden_dim 512 \
     --lstm_num_layers 2 \
+    --anticipation_hoi_coef "${ANTICIPATION_HOI_COEF}" \
+    --anticipation_horizon_gamma "${ANTICIPATION_HORIZON_GAMMA}" \
+    --anticipation_ramp_epochs "${ANTICIPATION_RAMP_EPOCHS}" \
+    --anticipation_ramp_start_factor "${ANTICIPATION_RAMP_START_FACTOR}" \
+    --detection_frame_weighting "${DETECTION_FRAME_WEIGHTING}" \
+    --detection_frame_weight_power "${DETECTION_FRAME_WEIGHT_POWER}" \
     ${RESUME:+--resume "${RESUME}"} \
     "$@"

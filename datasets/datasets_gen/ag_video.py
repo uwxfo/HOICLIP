@@ -617,11 +617,9 @@ class AG_Clip():
                         
                             }
                         )
-                if hois_future:
-                    anticipations["future"].append(future)
-                    anticipations["hois_future"].append(hois_future)
-                    #anticipations["boxes_future"]=torch.cat([targets["boxes"][-1], *boxes_future], dim=0)
-                    #anticipations["labels_future"]=torch.cat([targets["labels"][-1], *labels_future], dim=0)
+                # Preserve empty-GT horizons so future false positives remain evaluable.
+                anticipations["future"].append(future)
+                anticipations["hois_future"].append(hois_future)
 
             if anticipations["future"]:
                 targets.update(anticipations)

@@ -47,6 +47,38 @@ def _gather_hoi_eval_batch_on_main(results, targets, preds, gts):
         gts.extend(itertools.chain.from_iterable(gathered_targets))
 
 
+def _prepare_future_hoi_eval_batches(preds, gts):
+    """Build one prediction/GT list per anticipation horizon."""
+    horizons = [1, 3, 5, 7]
+    future_preds = {horizon: [] for horizon in horizons}
+    future_gts = {horizon: [] for horizon in horizons}
+    for pred, gt in zip(preds, gts):
+        if 'hoi_scores_future' not in pred or 'future' not in gt:
+            continue
+        scores = pred['hoi_scores_future']
+        if scores.shape[0] % len(horizons) != 0:
+            raise ValueError(
+                f"Future query count {scores.shape[0]} is not divisible by {len(horizons)}"
+            )
+        scores_by_horizon = scores.chunk(len(horizons), dim=0)
+        for horizon, future_hois in zip(gt['future'], gt['hois_future']):
+            horizon = int(horizon)
+            slot = horizons.index(horizon)
+            pred_horizon = {
+                key: value for key, value in pred.items()
+                if key != 'hoi_scores_future'
+            }
+            pred_horizon['hoi_scores'] = scores_by_horizon[slot]
+            gt_horizon = {
+                'boxes': gt['boxes'],
+                'labels': gt['labels'],
+                'hois': future_hois,
+            }
+            future_preds[horizon].append(pred_horizon)
+            future_gts[horizon].append(gt_horizon)
+    return future_preds, future_gts
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, lr_scheduler=None,
@@ -343,12 +375,32 @@ def evaluate_hoi(dataset_file, model, postprocessors, data_loader,
                                     use_nms_filter=args.use_nms_filter,
                                     thres_nms=args.thres_nms, nms_alpha=args.nms_alpha,
                                     nms_beta=args.nms_beta,
-                                    output_dir=args.output_dir if args.eval else "")
+                                    output_dir=args.output_dir if args.eval else "",
+                                    suffix='_current')
     else:
         raise NotImplementedError
     print(f'Evaluating {len(preds)} frames...')
     start_time = time.time()
     stats = evaluator.evaluate()
+    if dataset_file in ('vidhoi', 'ag') and any(
+        'hoi_scores_future' in pred for pred in preds
+    ):
+        future_preds, future_gts = _prepare_future_hoi_eval_batches(preds, gts)
+        for horizon in (1, 3, 5, 7):
+            if not future_preds[horizon]:
+                continue
+            print(f'Evaluating {len(future_preds[horizon])} frames at future {horizon}...')
+            evaluator_future = VidHOIEvaluator(
+                future_preds[horizon], future_gts[horizon], args.hoi_path,
+                use_nms_filter=args.use_nms_filter,
+                thres_nms=args.thres_nms,
+                nms_alpha=args.nms_alpha,
+                nms_beta=args.nms_beta,
+                output_dir=args.output_dir if args.eval else "",
+                suffix=f'_f{horizon}',
+            )
+            stats_future = evaluator_future.evaluate()
+            stats.update({f'{key}_f{horizon}': value for key, value in stats_future.items()})
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Total time computing mAP: {}'.format(total_time_str))
@@ -378,7 +430,9 @@ def evaluate_hoi_transition(dataset_file, model, postprocessors, data_loader,
     # Trans[h]: [N_hoi, N_hoi] with T[i, j] = P(current triplet i | future triplet j).
     # Kept on `device` since the noise-OR propagation below runs on GPU.
     Trans = {k: torch.as_tensor(v, dtype=torch.float32, device=device)
-             for k, v in extract_transition_matrix(args.transition_matrix_type).items()}
+             for k, v in extract_transition_matrix(
+                 args.transition_matrix_type, dataset_file
+             ).items()}
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
